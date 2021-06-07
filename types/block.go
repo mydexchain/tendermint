@@ -19,10 +19,13 @@ import (
 	tmsync "github.com/mydexchain/tendermint/libs/sync"
 	tmproto "github.com/mydexchain/tendermint/proto/tendermint/types"
 	tmversion "github.com/mydexchain/tendermint/proto/tendermint/version"
+	"github.com/mydexchain/tendermint/version"
 )
 
 const (
 	// MaxHeaderBytes is a maximum header size.
+	// NOTE: Because app hash can be of arbitrary size, the header is therefore not
+	// capped in size and thus this number should be seen as a soft max
 	MaxHeaderBytes int64 = 626
 
 	// MaxOverheadForBlock - maximum overhead to encode a block (up to
@@ -87,17 +90,6 @@ func (b *Block) ValidateBasic() error {
 
 	// NOTE: b.Evidence.Evidence may be nil, but we're just looping.
 	for i, ev := range b.Evidence.Evidence {
-		switch ev.(type) {
-		case *ConflictingHeadersEvidence:
-			// ConflictingHeadersEvidence must be broken up in pieces and never
-			// committed as a single piece.
-			return fmt.Errorf("found ConflictingHeadersEvidence (#%d)", i)
-		case *PotentialAmnesiaEvidence:
-			// PotentialAmnesiaEvidence does not contribute to anything on its own, so
-			// reject it as well.
-			return fmt.Errorf("found PotentialAmnesiaEvidence (#%d)", i)
-		}
-
 		if err := ev.ValidateBasic(); err != nil {
 			return fmt.Errorf("invalid evidence (#%d): %v", i, err)
 		}
@@ -263,7 +255,9 @@ func BlockFromProto(bp *tmproto.Block) (*Block, error) {
 		return nil, err
 	}
 	b.Data = data
-	b.Evidence.FromProto(&bp.Evidence)
+	if err := b.Evidence.FromProto(&bp.Evidence); err != nil {
+		return nil, err
+	}
 
 	if bp.LastCommit != nil {
 		lc, err := CommitFromProto(bp.LastCommit)
@@ -281,12 +275,12 @@ func BlockFromProto(bp *tmproto.Block) (*Block, error) {
 // MaxDataBytes returns the maximum size of block's data.
 //
 // XXX: Panics on negative result.
-func MaxDataBytes(maxBytes int64, valsCount, evidenceCount int) int64 {
+func MaxDataBytes(maxBytes, evidenceBytes int64, valsCount int) int64 {
 	maxDataBytes := maxBytes -
 		MaxOverheadForBlock -
 		MaxHeaderBytes -
-		int64(valsCount)*MaxVoteBytes -
-		int64(evidenceCount)*MaxEvidenceBytes
+		MaxCommitBytes(valsCount) -
+		evidenceBytes
 
 	if maxDataBytes < 0 {
 		panic(fmt.Sprintf(
@@ -297,21 +291,18 @@ func MaxDataBytes(maxBytes int64, valsCount, evidenceCount int) int64 {
 	}
 
 	return maxDataBytes
-
 }
 
-// MaxDataBytesUnknownEvidence returns the maximum size of block's data when
+// MaxDataBytesNoEvidence returns the maximum size of block's data when
 // evidence count is unknown. MaxEvidencePerBlock will be used for the size
 // of evidence.
 //
 // XXX: Panics on negative result.
-func MaxDataBytesUnknownEvidence(maxBytes int64, valsCount int, maxNumEvidence uint32) int64 {
-	maxEvidenceBytes := int64(maxNumEvidence) * MaxEvidenceBytes
+func MaxDataBytesNoEvidence(maxBytes int64, valsCount int) int64 {
 	maxDataBytes := maxBytes -
 		MaxOverheadForBlock -
 		MaxHeaderBytes -
-		int64(valsCount)*MaxVoteBytes -
-		maxEvidenceBytes
+		MaxCommitBytes(valsCount)
 
 	if maxDataBytes < 0 {
 		panic(fmt.Sprintf(
@@ -384,6 +375,9 @@ func (h *Header) Populate(
 //
 // NOTE: Timestamp validation is subtle and handled elsewhere.
 func (h Header) ValidateBasic() error {
+	if h.Version.Block != version.BlockProtocol {
+		return fmt.Errorf("block protocol is incorrect: got: %d, want: %d ", h.Version.Block, version.BlockProtocol)
+	}
 	if len(h.ChainID) > MaxChainIDLen {
 		return fmt.Errorf("chainID is too long; got: %d, max: %d", len(h.ChainID), MaxChainIDLen)
 	}
@@ -588,6 +582,14 @@ const (
 	BlockIDFlagNil
 )
 
+const (
+	// Max size of commit without any commitSigs -> 82 for BlockID, 8 for Height, 4 for Round.
+	MaxCommitOverheadBytes int64 = 94
+	// Commit sig size is made up of 64 bytes for the signature, 20 bytes for the address,
+	// 1 byte for the flag and 14 bytes for the timestamp
+	MaxCommitSigBytes int64 = 109
+)
+
 // CommitSig is a part of the Vote included in a Commit.
 type CommitSig struct {
 	BlockIDFlag      BlockIDFlag `json:"block_id_flag"`
@@ -606,9 +608,10 @@ func NewCommitSigForBlock(signature []byte, valAddr Address, ts time.Time) Commi
 	}
 }
 
-// ForBlock returns true if CommitSig is for the block.
-func (cs CommitSig) ForBlock() bool {
-	return cs.BlockIDFlag == BlockIDFlagCommit
+func MaxCommitBytes(valCount int) int64 {
+	// From the repeated commit sig field
+	var protoEncodingOverhead int64 = 2
+	return MaxCommitOverheadBytes + ((MaxCommitSigBytes + protoEncodingOverhead) * int64(valCount))
 }
 
 // NewCommitSigAbsent returns new CommitSig with BlockIDFlagAbsent. Other
@@ -617,6 +620,11 @@ func NewCommitSigAbsent() CommitSig {
 	return CommitSig{
 		BlockIDFlag: BlockIDFlagAbsent,
 	}
+}
+
+// ForBlock returns true if CommitSig is for the block.
+func (cs CommitSig) ForBlock() bool {
+	return cs.BlockIDFlag == BlockIDFlagCommit
 }
 
 // Absent returns true if CommitSig is absent.
@@ -942,10 +950,7 @@ func (commit *Commit) ToProto() *tmproto.Commit {
 	c.Height = commit.Height
 	c.Round = commit.Round
 	c.BlockID = commit.BlockID.ToProto()
-	if commit.hash != nil {
-		c.Hash = commit.hash
-	}
-	c.BitArray = commit.bitArray.ToProto()
+
 	return c
 }
 
@@ -957,16 +962,13 @@ func CommitFromProto(cp *tmproto.Commit) (*Commit, error) {
 	}
 
 	var (
-		commit   = new(Commit)
-		bitArray *bits.BitArray
+		commit = new(Commit)
 	)
 
 	bi, err := BlockIDFromProto(&cp.BlockID)
 	if err != nil {
 		return nil, err
 	}
-
-	bitArray.FromProto(cp.BitArray)
 
 	sigs := make([]CommitSig, len(cp.Signatures))
 	for i := range cp.Signatures {
@@ -979,120 +981,8 @@ func CommitFromProto(cp *tmproto.Commit) (*Commit, error) {
 	commit.Height = cp.Height
 	commit.Round = cp.Round
 	commit.BlockID = *bi
-	commit.hash = cp.Hash
-	commit.bitArray = bitArray
 
 	return commit, commit.ValidateBasic()
-}
-
-//-----------------------------------------------------------------------------
-
-// SignedHeader is a header along with the commits that prove it.
-// It is the basis of the light client.
-type SignedHeader struct {
-	*Header `json:"header"`
-
-	Commit *Commit `json:"commit"`
-}
-
-// ValidateBasic does basic consistency checks and makes sure the header
-// and commit are consistent.
-//
-// NOTE: This does not actually check the cryptographic signatures.  Make sure
-// to use a Verifier to validate the signatures actually provide a
-// significantly strong proof for this header's validity.
-func (sh SignedHeader) ValidateBasic(chainID string) error {
-	if sh.Header == nil {
-		return errors.New("missing header")
-	}
-	if sh.Commit == nil {
-		return errors.New("missing commit")
-	}
-
-	if err := sh.Header.ValidateBasic(); err != nil {
-		return fmt.Errorf("invalid header: %w", err)
-	}
-	if err := sh.Commit.ValidateBasic(); err != nil {
-		return fmt.Errorf("invalid commit: %w", err)
-	}
-
-	if sh.ChainID != chainID {
-		return fmt.Errorf("header belongs to another chain %q, not %q", sh.ChainID, chainID)
-	}
-
-	// Make sure the header is consistent with the commit.
-	if sh.Commit.Height != sh.Height {
-		return fmt.Errorf("header and commit height mismatch: %d vs %d", sh.Height, sh.Commit.Height)
-	}
-	if hhash, chash := sh.Hash(), sh.Commit.BlockID.Hash; !bytes.Equal(hhash, chash) {
-		return fmt.Errorf("commit signs block %X, header is block %X", chash, hhash)
-	}
-
-	return nil
-}
-
-// String returns a string representation of SignedHeader.
-func (sh SignedHeader) String() string {
-	return sh.StringIndented("")
-}
-
-// StringIndented returns an indented string representation of SignedHeader.
-//
-// Header
-// Commit
-func (sh SignedHeader) StringIndented(indent string) string {
-	return fmt.Sprintf(`SignedHeader{
-%s  %v
-%s  %v
-%s}`,
-		indent, sh.Header.StringIndented(indent+"  "),
-		indent, sh.Commit.StringIndented(indent+"  "),
-		indent)
-}
-
-// ToProto converts SignedHeader to protobuf
-func (sh *SignedHeader) ToProto() *tmproto.SignedHeader {
-	if sh == nil {
-		return nil
-	}
-
-	psh := new(tmproto.SignedHeader)
-	if sh.Header != nil {
-		psh.Header = sh.Header.ToProto()
-	}
-	if sh.Commit != nil {
-		psh.Commit = sh.Commit.ToProto()
-	}
-
-	return psh
-}
-
-// FromProto sets a protobuf SignedHeader to the given pointer.
-// It returns an error if the hader or the commit is invalid.
-func SignedHeaderFromProto(shp *tmproto.SignedHeader) (*SignedHeader, error) {
-	if shp == nil {
-		return nil, errors.New("nil SignedHeader")
-	}
-
-	sh := new(SignedHeader)
-
-	if shp.Header != nil {
-		h, err := HeaderFromProto(shp.Header)
-		if err != nil {
-			return nil, err
-		}
-		sh.Header = &h
-	}
-
-	if shp.Commit != nil {
-		c, err := CommitFromProto(shp.Commit)
-		if err != nil {
-			return nil, err
-		}
-		sh.Commit = c
-	}
-
-	return sh, nil
 }
 
 //-----------------------------------------------------------------------------
@@ -1152,10 +1042,6 @@ func (data *Data) ToProto() tmproto.Data {
 		tp.Txs = txBzs
 	}
 
-	if data.hash != nil {
-		tp.Hash = data.hash
-	}
-
 	return *tp
 }
 
@@ -1177,8 +1063,6 @@ func DataFromProto(dp *tmproto.Data) (Data, error) {
 		data.Txs = Txs{}
 	}
 
-	data.hash = dp.Hash
-
 	return *data, nil
 }
 
@@ -1188,8 +1072,9 @@ func DataFromProto(dp *tmproto.Data) (Data, error) {
 type EvidenceData struct {
 	Evidence EvidenceList `json:"evidence"`
 
-	// Volatile
-	hash tmbytes.HexBytes
+	// Volatile. Used as cache
+	hash     tmbytes.HexBytes
+	byteSize int64
 }
 
 // Hash returns the hash of the data.
@@ -1198,6 +1083,18 @@ func (data *EvidenceData) Hash() tmbytes.HexBytes {
 		data.hash = data.Evidence.Hash()
 	}
 	return data.hash
+}
+
+// ByteSize returns the total byte size of all the evidence
+func (data *EvidenceData) ByteSize() int64 {
+	if data.byteSize == 0 && len(data.Evidence) != 0 {
+		pb, err := data.ToProto()
+		if err != nil {
+			panic(err)
+		}
+		data.byteSize = int64(pb.Size())
+	}
+	return data.byteSize
 }
 
 // StringIndented returns a string representation of the evidence.
@@ -1221,12 +1118,12 @@ func (data *EvidenceData) StringIndented(indent string) string {
 }
 
 // ToProto converts EvidenceData to protobuf
-func (data *EvidenceData) ToProto() (*tmproto.EvidenceData, error) {
+func (data *EvidenceData) ToProto() (*tmproto.EvidenceList, error) {
 	if data == nil {
 		return nil, errors.New("nil evidence data")
 	}
 
-	evi := new(tmproto.EvidenceData)
+	evi := new(tmproto.EvidenceList)
 	eviBzs := make([]tmproto.Evidence, len(data.Evidence))
 	for i := range data.Evidence {
 		protoEvi, err := EvidenceToProto(data.Evidence[i])
@@ -1237,15 +1134,11 @@ func (data *EvidenceData) ToProto() (*tmproto.EvidenceData, error) {
 	}
 	evi.Evidence = eviBzs
 
-	if data.hash != nil {
-		evi.Hash = data.hash
-	}
-
 	return evi, nil
 }
 
 // FromProto sets a protobuf EvidenceData to the given pointer.
-func (data *EvidenceData) FromProto(eviData *tmproto.EvidenceData) error {
+func (data *EvidenceData) FromProto(eviData *tmproto.EvidenceList) error {
 	if eviData == nil {
 		return errors.New("nil evidenceData")
 	}
@@ -1259,8 +1152,7 @@ func (data *EvidenceData) FromProto(eviData *tmproto.EvidenceData) error {
 		eviBzs[i] = evi
 	}
 	data.Evidence = eviBzs
-
-	data.hash = eviData.GetHash()
+	data.byteSize = int64(eviData.Size())
 
 	return nil
 }

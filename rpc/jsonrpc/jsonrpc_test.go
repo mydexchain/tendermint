@@ -37,6 +37,10 @@ const (
 	testVal = "acbd"
 )
 
+var (
+	ctx = context.Background()
+)
+
 type ResultEcho struct {
 	Value string `json:"value"`
 }
@@ -125,7 +129,11 @@ func setup() {
 	if err != nil {
 		panic(err)
 	}
-	go server.Serve(listener1, mux, tcpLogger, config)
+	go func() {
+		if err := server.Serve(listener1, mux, tcpLogger, config); err != nil {
+			panic(err)
+		}
+	}()
 
 	unixLogger := logger.With("socket", "unix")
 	mux2 := http.NewServeMux()
@@ -137,7 +145,11 @@ func setup() {
 	if err != nil {
 		panic(err)
 	}
-	go server.Serve(listener2, mux2, unixLogger, config)
+	go func() {
+		if err := server.Serve(listener2, mux2, unixLogger, config); err != nil {
+			panic(err)
+		}
+	}()
 
 	// wait for servers to start
 	time.Sleep(time.Second * 2)
@@ -148,7 +160,7 @@ func echoViaHTTP(cl client.Caller, val string) (string, error) {
 		"arg": val,
 	}
 	result := new(ResultEcho)
-	if _, err := cl.Call("echo", params, result); err != nil {
+	if _, err := cl.Call(ctx, "echo", params, result); err != nil {
 		return "", err
 	}
 	return result.Value, nil
@@ -159,7 +171,7 @@ func echoIntViaHTTP(cl client.Caller, val int) (int, error) {
 		"arg": val,
 	}
 	result := new(ResultEchoInt)
-	if _, err := cl.Call("echo_int", params, result); err != nil {
+	if _, err := cl.Call(ctx, "echo_int", params, result); err != nil {
 		return 0, err
 	}
 	return result.Value, nil
@@ -170,7 +182,7 @@ func echoBytesViaHTTP(cl client.Caller, bytes []byte) ([]byte, error) {
 		"arg": bytes,
 	}
 	result := new(ResultEchoBytes)
-	if _, err := cl.Call("echo_bytes", params, result); err != nil {
+	if _, err := cl.Call(ctx, "echo_bytes", params, result); err != nil {
 		return []byte{}, err
 	}
 	return result.Value, nil
@@ -181,7 +193,7 @@ func echoDataBytesViaHTTP(cl client.Caller, bytes tmbytes.HexBytes) (tmbytes.Hex
 		"arg": bytes,
 	}
 	result := new(ResultEchoDataBytes)
-	if _, err := cl.Call("echo_data_bytes", params, result); err != nil {
+	if _, err := cl.Call(ctx, "echo_data_bytes", params, result); err != nil {
 		return []byte{}, err
 	}
 	return result.Value, nil
@@ -392,5 +404,5 @@ func randBytes(t *testing.T) []byte {
 	buf := make([]byte, n)
 	_, err := crand.Read(buf)
 	require.Nil(t, err)
-	return bytes.Replace(buf, []byte("="), []byte{100}, -1)
+	return bytes.ReplaceAll(buf, []byte("="), []byte{100})
 }

@@ -13,9 +13,7 @@ import (
 )
 
 const (
-	// MaxVoteBytes is a maximum vote size (including amino overhead).
-	MaxVoteBytes int64  = 209
-	nilVoteStr   string = "nil-Vote"
+	nilVoteStr string = "nil-Vote"
 )
 
 var (
@@ -85,9 +83,11 @@ func (vote *Vote) CommitSig() CommitSig {
 }
 
 // VoteSignBytes returns the proto-encoding of the canonicalized Vote, for
-// signing.
+// signing. Panics is the marshaling fails.
 //
-// Panics if the marshaling fails.
+// The encoded Protobuf message is varint length-prefixed (using MarshalDelimited)
+// for backwards-compatibility with the Amino encoding, due to e.g. hardware
+// devices that rely on this encoding.
 //
 // See CanonicalizeVote
 func VoteSignBytes(chainID string, vote *tmproto.Vote) []byte {
@@ -220,7 +220,7 @@ func (vote *Vote) ToProto() *tmproto.Vote {
 	}
 }
 
-//FromProto converts a proto generetad type to a handwritten type
+// FromProto converts a proto generetad type to a handwritten type
 // return type, nil if everything converts safely, otherwise nil, error
 func VoteFromProto(pv *tmproto.Vote) (*Vote, error) {
 	if pv == nil {

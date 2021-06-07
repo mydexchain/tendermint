@@ -1,13 +1,20 @@
 package encoding
 
 import (
-	"errors"
 	"fmt"
 
 	"github.com/mydexchain/tendermint/crypto"
 	"github.com/mydexchain/tendermint/crypto/ed25519"
+	"github.com/mydexchain/tendermint/crypto/secp256k1"
+	"github.com/mydexchain/tendermint/libs/json"
 	pc "github.com/mydexchain/tendermint/proto/tendermint/crypto"
 )
+
+func init() {
+	json.RegisterType((*pc.PublicKey)(nil), "tendermint.crypto.PublicKey")
+	json.RegisterType((*pc.PublicKey_Ed25519)(nil), "tendermint.crypto.PublicKey_Ed25519")
+	json.RegisterType((*pc.PublicKey_Secp256K1)(nil), "tendermint.crypto.PublicKey_Secp256K1")
+}
 
 // PubKeyToProto takes crypto.PubKey and transforms it to a protobuf Pubkey
 func PubKeyToProto(k crypto.PubKey) (pc.PublicKey, error) {
@@ -17,6 +24,12 @@ func PubKeyToProto(k crypto.PubKey) (pc.PublicKey, error) {
 		kp = pc.PublicKey{
 			Sum: &pc.PublicKey_Ed25519{
 				Ed25519: k,
+			},
+		}
+	case secp256k1.PubKey:
+		kp = pc.PublicKey{
+			Sum: &pc.PublicKey_Secp256K1{
+				Secp256K1: k,
 			},
 		}
 	default:
@@ -36,40 +49,15 @@ func PubKeyFromProto(k pc.PublicKey) (crypto.PubKey, error) {
 		pk := make(ed25519.PubKey, ed25519.PubKeySize)
 		copy(pk, k.Ed25519)
 		return pk, nil
-	default:
-		return nil, fmt.Errorf("fromproto: key type %v is not supported", k)
-	}
-}
-
-// PrivKeyToProto takes crypto.PrivKey and transforms it to a protobuf PrivKey
-func PrivKeyToProto(k crypto.PrivKey) (pc.PrivateKey, error) {
-	var kp pc.PrivateKey
-	switch k := k.(type) {
-	case ed25519.PrivKey:
-		kp = pc.PrivateKey{
-			Sum: &pc.PrivateKey_Ed25519{
-				Ed25519: k,
-			},
-		}
-	default:
-		return kp, errors.New("toproto: key type is not supported")
-	}
-	return kp, nil
-}
-
-// PrivKeyFromProto takes a protobuf PrivateKey and transforms it to a crypto.PrivKey
-func PrivKeyFromProto(k pc.PrivateKey) (crypto.PrivKey, error) {
-	switch k := k.Sum.(type) {
-	case *pc.PrivateKey_Ed25519:
-
-		if len(k.Ed25519) != ed25519.PubKeySize {
+	case *pc.PublicKey_Secp256K1:
+		if len(k.Secp256K1) != secp256k1.PubKeySize {
 			return nil, fmt.Errorf("invalid size for PubKeyEd25519. Got %d, expected %d",
-				len(k.Ed25519), ed25519.PubKeySize)
+				len(k.Secp256K1), secp256k1.PubKeySize)
 		}
-		pk := make(ed25519.PrivKey, ed25519.PrivateKeySize)
-		copy(pk, k.Ed25519)
+		pk := make(secp256k1.PubKey, secp256k1.PubKeySize)
+		copy(pk, k.Secp256K1)
 		return pk, nil
 	default:
-		return nil, errors.New("fromproto: key type not supported")
+		return nil, fmt.Errorf("fromproto: key type %v is not supported", k)
 	}
 }

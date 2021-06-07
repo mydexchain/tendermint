@@ -75,11 +75,11 @@ func NewBlockchainReactor(state sm.State, blockExec *sm.BlockExecutor, store *st
 	const capacity = 1000                      // must be bigger than peers count
 	errorsCh := make(chan peerError, capacity) // so we don't block in #Receive#pool.AddBlock
 
-	pool := NewBlockPool(
-		store.Height()+1,
-		requestsCh,
-		errorsCh,
-	)
+	startHeight := store.Height() + 1
+	if startHeight == 1 {
+		startHeight = state.InitialHeight
+	}
+	pool := NewBlockPool(startHeight, requestsCh, errorsCh)
 
 	bcR := &BlockchainReactor{
 		initialState: state,
@@ -129,7 +129,9 @@ func (bcR *BlockchainReactor) SwitchToFastSync(state sm.State) error {
 // OnStop implements service.Service.
 func (bcR *BlockchainReactor) OnStop() {
 	if bcR.fastSync {
-		bcR.pool.Stop()
+		if err := bcR.pool.Stop(); err != nil {
+			bcR.Logger.Error("Error stopping pool", "err", err)
+		}
 	}
 }
 
@@ -313,7 +315,9 @@ FOR_LOOP:
 				"outbound", outbound, "inbound", inbound)
 			if bcR.pool.IsCaughtUp() {
 				bcR.Logger.Info("Time to switch to consensus reactor!", "height", height)
-				bcR.pool.Stop()
+				if err := bcR.pool.Stop(); err != nil {
+					bcR.Logger.Error("Error stopping pool", "err", err)
+				}
 				conR, ok := bcR.Switch.Reactor("CONSENSUS").(consensusReactor)
 				if ok {
 					conR.SwitchToConsensus(state, blocksSynced > 0 || stateSynced)
@@ -342,7 +346,7 @@ FOR_LOOP:
 
 			// See if there are any blocks to sync.
 			first, second := bcR.pool.PeekTwoBlocks()
-			//bcR.Logger.Info("TrySync peeked", "first", first, "second", second)
+			// bcR.Logger.Info("TrySync peeked", "first", first, "second", second)
 			if first == nil || second == nil {
 				// We need both to sync the first block.
 				continue FOR_LOOP
@@ -358,7 +362,7 @@ FOR_LOOP:
 			// NOTE: we can probably make this more efficient, but note that calling
 			// first.Hash() doesn't verify the tx contents, so MakePartSet() is
 			// currently necessary.
-			err := state.Validators.VerifyCommit(
+			err := state.Validators.VerifyCommitLight(
 				chainID, firstID, first.Height, second.LastCommit)
 			if err != nil {
 				bcR.Logger.Error("Error in validation", "err", err)

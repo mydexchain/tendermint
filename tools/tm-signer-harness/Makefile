@@ -2,7 +2,8 @@
 
 TENDERMINT_VERSION?=latest
 BUILD_TAGS?='tendermint'
-BUILD_FLAGS = -ldflags "-X github.com/mydexchain/tendermint/version.GitCommit=`git rev-parse --short=8 HEAD`"
+VERSION := $(shell git describe --always)
+BUILD_FLAGS = -ldflags "-X github.com/mydexchain/tendermint/version.TMCoreSemVer=$(VERSION)
 
 .DEFAULT_GOAL := build
 

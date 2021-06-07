@@ -444,7 +444,7 @@ func benchmarkNClients(n int, b *testing.B) {
 		err = s.PublishWithEvents(
 			ctx,
 			"Gamora",
-			map[string][]string{"abci.Account.Owner": {"Ivan"}, "abci.Invoices.Number": {string(i)}},
+			map[string][]string{"abci.Account.Owner": {"Ivan"}, "abci.Invoices.Number": {string(rune(i))}},
 		)
 		require.NoError(b, err)
 	}
@@ -488,9 +488,7 @@ func benchmarkNClientsOneQuery(n int, b *testing.B) {
 	}
 }
 
-///////////////////////////////////////////////////////////////////////////////
-/// HELPERS
-///////////////////////////////////////////////////////////////////////////////
+// HELPERS
 
 func assertReceive(t *testing.T, expected interface{}, ch <-chan pubsub.Message, msgAndArgs ...interface{}) {
 	select {

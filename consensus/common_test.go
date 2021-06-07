@@ -25,7 +25,6 @@ import (
 	abci "github.com/mydexchain/tendermint/abci/types"
 	cfg "github.com/mydexchain/tendermint/config"
 	cstypes "github.com/mydexchain/tendermint/consensus/types"
-	"github.com/mydexchain/tendermint/evidence"
 	tmbytes "github.com/mydexchain/tendermint/libs/bytes"
 	"github.com/mydexchain/tendermint/libs/log"
 	tmos "github.com/mydexchain/tendermint/libs/os"
@@ -387,19 +386,26 @@ func newStateWithConfigAndBlockStore(
 		mempool.EnableTxsAvailable()
 	}
 
-	evpool := emptyEvidencePool{}
+	evpool := sm.EmptyEvidencePool{}
 
 	// Make State
 	stateDB := blockDB
-	sm.SaveState(stateDB, state) //for save height 1's validators info
-	blockExec := sm.NewBlockExecutor(stateDB, log.TestingLogger(), proxyAppConnCon, mempool, evpool)
+	stateStore := sm.NewStore(stateDB)
+	if err := stateStore.Save(state); err != nil { // for save height 1's validators info
+		panic(err)
+	}
+
+	blockExec := sm.NewBlockExecutor(stateStore, log.TestingLogger(), proxyAppConnCon, mempool, evpool)
 	cs := NewState(thisConfig.Consensus, state, blockExec, blockStore, mempool, evpool)
 	cs.SetLogger(log.TestingLogger().With("module", "consensus"))
 	cs.SetPrivValidator(pv)
 
 	eventBus := types.NewEventBus()
 	eventBus.SetLogger(log.TestingLogger().With("module", "events"))
-	eventBus.Start()
+	err := eventBus.Start()
+	if err != nil {
+		panic(err)
+	}
 	cs.SetEventBus(eventBus)
 	return cs
 }
@@ -428,49 +434,6 @@ func randState(nValidators int) (*State, []*validatorStub) {
 	incrementHeight(vss[1:]...)
 
 	return cs, vss
-}
-
-func randStateWithEvpool(t *testing.T, nValidators int) (*State, []*validatorStub, *evidence.Pool) {
-	state, privVals := randGenesisState(nValidators, false, 10)
-
-	vss := make([]*validatorStub, nValidators)
-
-	app := counter.NewApplication(true)
-	config := cfg.ResetTestRoot("consensus_state_test")
-
-	blockStore := store.NewBlockStore(dbm.NewMemDB())
-	evidenceDB := dbm.NewMemDB()
-
-	mtx := new(tmsync.Mutex)
-	proxyAppConnMem := abcicli.NewLocalClient(mtx, app)
-	proxyAppConnCon := abcicli.NewLocalClient(mtx, app)
-
-	mempool := mempl.NewCListMempool(config.Mempool, proxyAppConnMem, 0)
-	mempool.SetLogger(log.TestingLogger().With("module", "mempool"))
-	if config.Consensus.WaitForTxs() {
-		mempool.EnableTxsAvailable()
-	}
-	stateDB := dbm.NewMemDB()
-	sm.SaveState(stateDB, state)
-	evpool, err := evidence.NewPool(stateDB, evidenceDB, blockStore)
-	require.NoError(t, err)
-	blockExec := sm.NewBlockExecutor(stateDB, log.TestingLogger(), proxyAppConnCon, mempool, evpool)
-	cs := NewState(config.Consensus, state, blockExec, blockStore, mempool, evpool)
-	cs.SetLogger(log.TestingLogger().With("module", "consensus"))
-	cs.SetPrivValidator(privVals[0])
-
-	eventBus := types.NewEventBus()
-	eventBus.SetLogger(log.TestingLogger().With("module", "events"))
-	eventBus.Start()
-	cs.SetEventBus(eventBus)
-
-	for i := 0; i < nValidators; i++ {
-		vss[i] = newValidatorStub(privVals[i], int32(i))
-	}
-	// since cs1 starts at 1
-	incrementHeight(vss[1:]...)
-
-	return cs, vss, evpool
 }
 
 //-------------------------------------------------------------------------------
@@ -640,7 +603,7 @@ func ensureProposal(proposalCh <-chan tmpubsub.Message, height int64, round int3
 			panic(fmt.Sprintf("expected round %v, got %v", round, proposalEvent.Round))
 		}
 		if !proposalEvent.BlockID.Equals(propID) {
-			panic("Proposed block does not match expected block")
+			panic(fmt.Sprintf("Proposed block does not match expected block (%v != %v)", proposalEvent.BlockID, propID))
 		}
 	}
 }
@@ -717,7 +680,8 @@ func randConsensusNet(nValidators int, testName string, tickerFunc func() Timeou
 	configRootDirs := make([]string, 0, nValidators)
 	for i := 0; i < nValidators; i++ {
 		stateDB := dbm.NewMemDB() // each state needs its own db
-		state, _ := sm.LoadStateFromDBOrGenesisDoc(stateDB, genDoc)
+		stateStore := sm.NewStore(stateDB)
+		state, _ := stateStore.LoadFromDBOrGenesisDoc(genDoc)
 		thisConfig := ResetConfig(fmt.Sprintf("%s_%d", testName, i))
 		configRootDirs = append(configRootDirs, thisConfig.RootDir)
 		for _, opt := range configOpts {
@@ -754,7 +718,8 @@ func randConsensusNetWithPeers(
 	configRootDirs := make([]string, 0, nPeers)
 	for i := 0; i < nPeers; i++ {
 		stateDB := dbm.NewMemDB() // each state needs its own db
-		state, _ := sm.LoadStateFromDBOrGenesisDoc(stateDB, genDoc)
+		stateStore := sm.NewStore(stateDB)
+		state, _ := stateStore.LoadFromDBOrGenesisDoc(genDoc)
 		thisConfig := ResetConfig(fmt.Sprintf("%s_%d", testName, i))
 		configRootDirs = append(configRootDirs, thisConfig.RootDir)
 		ensureDir(filepath.Dir(thisConfig.Consensus.WalFile()), 0700) // dir for wal
@@ -784,7 +749,7 @@ func randConsensusNetWithPeers(
 			state.Version.Consensus.App = kvstore.ProtocolVersion
 		}
 		app.InitChain(abci.RequestInitChain{Validators: vals})
-		//sm.SaveState(stateDB,state)	//height 1's validatorsInfo already saved in LoadStateFromDBOrGenesisDoc above
+		// sm.SaveState(stateDB,state)	//height 1's validatorsInfo already saved in LoadStateFromDBOrGenesisDoc above
 
 		css[i] = newStateWithConfig(thisConfig, state, privVal, app)
 		css[i].SetTimeoutTicker(tickerFunc())

@@ -1,6 +1,7 @@
 package light_test
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	stdlog "log"
@@ -11,6 +12,7 @@ import (
 	dbm "github.com/mydexchain/tm-db"
 
 	"github.com/mydexchain/tendermint/abci/example/kvstore"
+	"github.com/mydexchain/tendermint/libs/log"
 	"github.com/mydexchain/tendermint/light"
 	"github.com/mydexchain/tendermint/light/provider"
 	httpp "github.com/mydexchain/tendermint/light/provider/http"
@@ -39,7 +41,7 @@ func ExampleClient_Update() {
 		stdlog.Fatal(err)
 	}
 
-	header, err := primary.SignedHeader(2)
+	block, err := primary.LightBlock(context.Background(), 2)
 	if err != nil {
 		stdlog.Fatal(err)
 	}
@@ -50,31 +52,30 @@ func ExampleClient_Update() {
 	}
 
 	c, err := light.NewClient(
+		context.Background(),
 		chainID,
 		light.TrustOptions{
 			Period: 504 * time.Hour, // 21 days
 			Height: 2,
-			Hash:   header.Hash(),
+			Hash:   block.Hash(),
 		},
 		primary,
 		[]provider.Provider{primary}, // NOTE: primary should not be used here
 		dbs.New(db, chainID),
-		// Logger(log.TestingLogger()),
+		light.Logger(log.TestingLogger()),
 	)
 	if err != nil {
 		stdlog.Fatal(err)
 	}
 	defer func() {
-		c.Cleanup()
+		if err := c.Cleanup(); err != nil {
+			stdlog.Fatal(err)
+		}
 	}()
 
 	time.Sleep(2 * time.Second)
 
-	// XXX: 30 * time.Minute clock drift is needed because a) Tendermint strips
-	// monotonic component (see types/time/time.go) b) single instance is being
-	// run.
-	// https://github.com/mydexchain/tendermint/issues/4489
-	h, err := c.Update(time.Now().Add(30 * time.Minute))
+	h, err := c.Update(context.Background(), time.Now())
 	if err != nil {
 		stdlog.Fatal(err)
 	}
@@ -87,8 +88,8 @@ func ExampleClient_Update() {
 	// Output: successful update
 }
 
-// Manually getting headers and verifying them.
-func ExampleClient_VerifyHeaderAtHeight() {
+// Manually getting light blocks and verifying them.
+func ExampleClient_VerifyLightBlockAtHeight() {
 	// give Tendermint time to generate some blocks
 	time.Sleep(5 * time.Second)
 
@@ -108,7 +109,7 @@ func ExampleClient_VerifyHeaderAtHeight() {
 		stdlog.Fatal(err)
 	}
 
-	header, err := primary.SignedHeader(2)
+	block, err := primary.LightBlock(context.Background(), 2)
 	if err != nil {
 		stdlog.Fatal(err)
 	}
@@ -119,30 +120,33 @@ func ExampleClient_VerifyHeaderAtHeight() {
 	}
 
 	c, err := light.NewClient(
+		context.Background(),
 		chainID,
 		light.TrustOptions{
 			Period: 504 * time.Hour, // 21 days
 			Height: 2,
-			Hash:   header.Hash(),
+			Hash:   block.Hash(),
 		},
 		primary,
 		[]provider.Provider{primary}, // NOTE: primary should not be used here
 		dbs.New(db, chainID),
-		// Logger(log.TestingLogger()),
+		light.Logger(log.TestingLogger()),
 	)
 	if err != nil {
 		stdlog.Fatal(err)
 	}
 	defer func() {
-		c.Cleanup()
+		if err := c.Cleanup(); err != nil {
+			stdlog.Fatal(err)
+		}
 	}()
 
-	_, err = c.VerifyHeaderAtHeight(3, time.Now())
+	_, err = c.VerifyLightBlockAtHeight(context.Background(), 3, time.Now())
 	if err != nil {
 		stdlog.Fatal(err)
 	}
 
-	h, err := c.TrustedHeader(3)
+	h, err := c.TrustedLightBlock(3)
 	if err != nil {
 		stdlog.Fatal(err)
 	}

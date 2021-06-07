@@ -248,7 +248,6 @@ func (c *WSClient) CallWithArrayParams(ctx context.Context, method string, param
 	return c.Send(ctx, request)
 }
 
-///////////////////////////////////////////////////////////////////////////////
 // Private methods
 
 func (c *WSClient) nextRequestID() types.JSONRPCIntID {
@@ -349,7 +348,10 @@ func (c *WSClient) reconnectRoutine() {
 			c.wg.Wait()
 			if err := c.reconnect(); err != nil {
 				c.Logger.Error("failed to reconnect", "err", err, "original_err", originalError)
-				c.Stop()
+				if err = c.Stop(); err != nil {
+					c.Logger.Error("failed to stop conn", "error", err)
+				}
+
 				return
 			}
 			// drain reconnectAfter
@@ -518,7 +520,6 @@ func (c *WSClient) readRoutine() {
 	}
 }
 
-///////////////////////////////////////////////////////////////////////////////
 // Predefined methods
 
 // Subscribe to a query. Note the server must have a "subscribe" route

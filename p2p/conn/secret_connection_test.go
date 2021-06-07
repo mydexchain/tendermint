@@ -19,7 +19,7 @@ import (
 
 	"github.com/mydexchain/tendermint/crypto"
 	"github.com/mydexchain/tendermint/crypto/ed25519"
-	"github.com/mydexchain/tendermint/crypto/secp256k1"
+	"github.com/mydexchain/tendermint/crypto/sr25519"
 	"github.com/mydexchain/tendermint/libs/async"
 	tmos "github.com/mydexchain/tendermint/libs/os"
 	tmrand "github.com/mydexchain/tendermint/libs/rand"
@@ -276,7 +276,7 @@ func TestNonEd25519Pubkey(t *testing.T) {
 	defer fooConn.Close()
 	defer barConn.Close()
 	var fooPrvKey = ed25519.GenPrivKey()
-	var barPrvKey = secp256k1.GenPrivKey()
+	var barPrvKey = sr25519.GenPrivKey()
 
 	go MakeSecretConnection(fooConn, fooPrvKey) //nolint:errcheck // ignore for tests
 
@@ -380,7 +380,6 @@ func makeSecretConnPair(tb testing.TB) (fooSecConn, barSecConn *SecretConnection
 	return fooSecConn, barSecConn
 }
 
-///////////////////////////////////////////////////////////////////////////////
 // Benchmarks
 
 func BenchmarkWriteSecretConnection(b *testing.B) {
@@ -428,7 +427,7 @@ func BenchmarkWriteSecretConnection(b *testing.B) {
 	if err := fooSecConn.Close(); err != nil {
 		b.Error(err)
 	}
-	//barSecConn.Close() race condition
+	// barSecConn.Close() race condition
 }
 
 func BenchmarkReadSecretConnection(b *testing.B) {

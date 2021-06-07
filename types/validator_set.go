@@ -708,9 +708,7 @@ func (vals *ValidatorSet) VerifyCommit(chainID string, blockID BlockID,
 	return nil
 }
 
-///////////////////////////////////////////////////////////////////////////////
 // LIGHT CLIENT VERIFICATION METHODS
-///////////////////////////////////////////////////////////////////////////////
 
 // VerifyCommitLight verifies +2/3 of the set had signed the given commit.
 //
@@ -820,6 +818,24 @@ func (vals *ValidatorSet) VerifyCommitLightTrusting(chainID string, commit *Comm
 	}
 
 	return ErrNotEnoughVotingPowerSigned{Got: talliedVotingPower, Needed: votingPowerNeeded}
+}
+
+// findPreviousProposer reverses the compare proposer priority function to find the validator
+// with the lowest proposer priority which would have been the previous proposer.
+//
+// Is used when recreating a validator set from an existing array of validators.
+func (vals *ValidatorSet) findPreviousProposer() *Validator {
+	var previousProposer *Validator
+	for _, val := range vals.Validators {
+		if previousProposer == nil {
+			previousProposer = val
+			continue
+		}
+		if previousProposer == previousProposer.CompareProposerPriority(val) {
+			previousProposer = val
+		}
+	}
+	return previousProposer
 }
 
 //-----------------
@@ -966,6 +982,25 @@ func ValidatorSetFromProto(vp *tmproto.ValidatorSet) (*ValidatorSet, error) {
 	return vals, vals.ValidateBasic()
 }
 
+// ValidatorSetFromExistingValidators takes an existing array of validators and rebuilds
+// the exact same validator set that corresponds to it without changing the proposer priority or power
+// if any of the validators fail validate basic then an empty set is returned.
+func ValidatorSetFromExistingValidators(valz []*Validator) (*ValidatorSet, error) {
+	for _, val := range valz {
+		err := val.ValidateBasic()
+		if err != nil {
+			return nil, fmt.Errorf("can't create validator set: %w", err)
+		}
+	}
+	vals := &ValidatorSet{
+		Validators: valz,
+	}
+	vals.Proposer = vals.findPreviousProposer()
+	vals.updateTotalVotingPower()
+	sort.Sort(ValidatorsByVotingPower(vals.Validators))
+	return vals, nil
+}
+
 //----------------------------------------
 
 // RandValidatorSet returns a randomized validator set (size: +numValidators+),
@@ -989,7 +1024,6 @@ func RandValidatorSet(numValidators int, votingPower int64) (*ValidatorSet, []Pr
 	return NewValidatorSet(valz), privValidators
 }
 
-///////////////////////////////////////////////////////////////////////////////
 // safe addition/subtraction/multiplication
 
 func safeAdd(a, b int64) (int64, bool) {

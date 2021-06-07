@@ -1,10 +1,10 @@
 package light
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
-	"github.com/mydexchain/tendermint/light/provider"
 	"github.com/mydexchain/tendermint/types"
 )
 
@@ -40,21 +40,11 @@ func (e ErrInvalidHeader) Error() string {
 	return fmt.Sprintf("invalid header: %v", e.Reason)
 }
 
-// ErrConflictingHeaders is thrown when two conflicting headers are discovered.
-type ErrConflictingHeaders struct {
-	H1      *types.SignedHeader
-	Primary provider.Provider
-
-	H2      *types.SignedHeader
-	Witness provider.Provider
-}
-
-func (e ErrConflictingHeaders) Error() string {
-	return fmt.Sprintf(
-		"header hash %X from primary %v does not match one %X from witness %v",
-		e.H1.Hash(), e.Primary,
-		e.H2.Hash(), e.Witness)
-}
+// ErrFailedHeaderCrossReferencing is returned when the detector was not able to cross reference the header
+// with any of the connected witnesses.
+var ErrFailedHeaderCrossReferencing = errors.New("all witnesses have either not responded, don't have the " +
+	" blocks or sent invalid blocks. You should look to change your witnesses" +
+	"  or review the light client's logs for more information")
 
 // ErrVerificationFailed means either sequential or skipping verification has
 // failed to verify from header #1 to header #2 due to some reason.
@@ -70,9 +60,21 @@ func (e ErrVerificationFailed) Unwrap() error {
 }
 
 func (e ErrVerificationFailed) Error() string {
+	return fmt.Sprintf("verify from #%d to #%d failed: %v", e.From, e.To, e.Reason)
+}
+
+// ----------------------------- INTERNAL ERRORS ---------------------------------
+
+// ErrConflictingHeaders is thrown when two conflicting headers are discovered.
+type errConflictingHeaders struct {
+	Block        *types.LightBlock
+	WitnessIndex int
+}
+
+func (e errConflictingHeaders) Error() string {
 	return fmt.Sprintf(
-		"verify from #%d to #%d failed: %v",
-		e.From, e.To, e.Reason)
+		"header hash (%X) from witness (%d) does not match primary",
+		e.Block.Hash(), e.WitnessIndex)
 }
 
 // errNoWitnesses means that there are not enough witnesses connected to
@@ -83,31 +85,13 @@ func (e errNoWitnesses) Error() string {
 	return "no witnesses connected. please reset light client"
 }
 
-type badWitnessCode int
-
-const (
-	noResponse badWitnessCode = iota + 1
-	invalidHeader
-	invalidValidatorSet
-)
-
 // errBadWitness is returned when the witness either does not respond or
 // responds with an invalid header.
 type errBadWitness struct {
 	Reason       error
-	Code         badWitnessCode
 	WitnessIndex int
 }
 
 func (e errBadWitness) Error() string {
-	switch e.Code {
-	case noResponse:
-		return fmt.Sprintf("failed to get a header/vals from witness: %v", e.Reason)
-	case invalidHeader:
-		return fmt.Sprintf("witness sent us invalid header: %v", e.Reason)
-	case invalidValidatorSet:
-		return fmt.Sprintf("witness sent us invalid validator set: %v", e.Reason)
-	default:
-		return fmt.Sprintf("unknown code: %d", e.Code)
-	}
+	return fmt.Sprintf("Witness %d returned error: %s", e.WitnessIndex, e.Reason.Error())
 }

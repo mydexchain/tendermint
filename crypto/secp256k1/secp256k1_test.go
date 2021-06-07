@@ -36,13 +36,14 @@ func TestPubKeySecp256k1Address(t *testing.T) {
 		addrBbz, _, _ := base58.CheckDecode(d.addr)
 		addrB := crypto.Address(addrBbz)
 
-		var priv secp256k1.PrivKey = privB
+		var priv secp256k1.PrivKey = secp256k1.PrivKey(privB)
 
 		pubKey := priv.PubKey()
 		pubT, _ := pubKey.(secp256k1.PubKey)
-
+		pub := pubT
 		addr := pubKey.Address()
-		assert.Equal(t, pubT, secp256k1.PubKey(pubB), "Expected pub keys to match")
+
+		assert.Equal(t, pub, secp256k1.PubKey(pubB), "Expected pub keys to match")
 		assert.Equal(t, addr, addrB, "Expected addresses to match")
 	}
 }
@@ -84,7 +85,7 @@ func TestSecp256k1LoadPrivkeyAndSerializeIsIdentity(t *testing.T) {
 	}
 }
 
-func TestGenPrivKeyFromSecret(t *testing.T) {
+func TestGenPrivKeySecp256k1(t *testing.T) {
 	// curve oder N
 	N := underlyingSecp256k1.S256().N
 	tests := []struct {
@@ -104,7 +105,7 @@ func TestGenPrivKeyFromSecret(t *testing.T) {
 	for _, tt := range tests {
 		tt := tt
 		t.Run(tt.name, func(t *testing.T) {
-			gotPrivKey := secp256k1.GenPrivKeyFromSecret(tt.secret)
+			gotPrivKey := secp256k1.GenPrivKeySecp256k1(tt.secret)
 			require.NotNil(t, gotPrivKey)
 			// interpret as a big.Int and make sure it is a valid field element:
 			fe := new(big.Int).SetBytes(gotPrivKey[:])

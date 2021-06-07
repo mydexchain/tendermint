@@ -2,7 +2,8 @@ PACKAGES=$(shell go list ./...)
 OUTPUT?=build/tendermint
 
 BUILD_TAGS?=tendermint
-LD_FLAGS = -X github.com/mydexchain/tendermint/version.GitCommit=`git rev-parse --short=8 HEAD`
+VERSION := $(shell git describe --always)
+LD_FLAGS = -X github.com/mydexchain/tendermint/version.TMCoreSemVer=$(VERSION)
 BUILD_FLAGS = -mod=readonly -ldflags "$(LD_FLAGS)"
 HTTPS_GIT := https://github.com/mydexchain/tendermint.git
 DOCKER_BUF := docker run -v $(shell pwd):/workspace --workdir /workspace bufbuild/buf
@@ -24,6 +25,22 @@ endif
 ifeq (cleveldb,$(findstring cleveldb,$(TENDERMINT_BUILD_OPTIONS)))
   CGO_ENABLED=1
   BUILD_TAGS += cleveldb
+endif
+
+# handle badgerdb
+ifeq (badgerdb,$(findstring badgerdb,$(TENDERMINT_BUILD_OPTIONS)))
+  BUILD_TAGS += badgerdb
+endif
+
+# handle rocksdb
+ifeq (rocksdb,$(findstring rocksdb,$(TENDERMINT_BUILD_OPTIONS)))
+  CGO_ENABLED=1
+  BUILD_TAGS += rocksdb
+endif
+
+# handle boltdb
+ifeq (boltdb,$(findstring boltdb,$(TENDERMINT_BUILD_OPTIONS)))
+  BUILD_TAGS += boltdb
 endif
 
 # allow users to pass additional flags via the conventional LDFLAGS variable
@@ -72,6 +89,11 @@ proto-gen-docker:
 proto-lint:
 	@$(DOCKER_BUF) check lint --error-format=json
 .PHONY: proto-lint
+
+proto-format:
+	@echo "Formatting Protobuf files"
+	docker run -v $(shell pwd):/workspace --workdir /workspace tendermintdev/docker-build-proto find ./ -not -path "./third_party/*" -name *.proto -exec clang-format -i {} \;
+.PHONY: proto-format
 
 proto-check-breaking:
 	@$(DOCKER_BUF) check breaking --against-input .git#branch=master
@@ -132,9 +154,9 @@ get_deps_bin_size:
 
 # generates certificates for TLS testing in remotedb and RPC server
 gen_certs: clean_certs
-	certstrap init --common-name "mydexchain.com" --passphrase ""
+	certstrap init --common-name "tendermint.com" --passphrase ""
 	certstrap request-cert --common-name "server" -ip "127.0.0.1" --passphrase ""
-	certstrap sign "server" --CA "mydexchain.com" --passphrase ""
+	certstrap sign "server" --CA "tendermint.com" --passphrase ""
 	mv out/server.crt rpc/jsonrpc/server/test.crt
 	mv out/server.key rpc/jsonrpc/server/test.key
 	rm -rf out
@@ -169,7 +191,7 @@ DESTINATION = ./index.html.md
 build-docs:
 	cd docs && \
 	while read p; do \
-		(git checkout $${p} && npm install && VUEPRESS_BASE="/$${p}/" npm run build) ; \
+		(git checkout $${p} . && npm install && VUEPRESS_BASE="/$${p}/" npm run build) ; \
 		mkdir -p ~/output/$${p} ; \
 		cp -r .vuepress/dist/* ~/output/$${p}/ ; \
 		cp ~/output/$${p}/index.html ~/output ; \
@@ -188,9 +210,9 @@ sync-docs:
 ###                            Docker image                                 ###
 ###############################################################################
 
-build-docker:
+build-docker: build-linux
 	cp $(OUTPUT) DOCKER/tendermint
-	docker build --label=tendermint --tag="mydexchain/tendermint" DOCKER
+	docker build --label=tendermint --tag="tendermint/tendermint" DOCKER
 	rm -rf DOCKER/tendermint
 .PHONY: build-docker
 
@@ -212,12 +234,12 @@ build-docker-localnode:
 # Linux-compatible binary. Produces a compatible binary at ./build/tendermint
 build_c-amazonlinux:
 	$(MAKE) -C ./DOCKER build_amazonlinux_buildimage
-	docker run --rm -it -v `pwd`:/tendermint mydexchain/tendermint:build_c-amazonlinux
+	docker run --rm -it -v `pwd`:/tendermint tendermint/tendermint:build_c-amazonlinux
 .PHONY: build_c-amazonlinux
 
 # Run a 4-node testnet locally
 localnet-start: localnet-stop build-docker-localnode
-	@if ! [ -f build/node0/config/genesis.json ]; then docker run --rm -v $(CURDIR)/build:/tendermint:Z tendermint/localnode testnet --config /etc/tendermint/config-template.toml --v 4 --o . --populate-persistent-peers --starting-ip-address 192.167.10.2; fi
+	@if ! [ -f build/node0/config/genesis.json ]; then docker run --rm -v $(CURDIR)/build:/tendermint:Z tendermint/localnode testnet --config /etc/tendermint/config-template.toml --o . --starting-ip-address 192.167.10.2; fi
 	docker-compose up
 .PHONY: localnet-start
 

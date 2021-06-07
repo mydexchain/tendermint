@@ -24,6 +24,8 @@ import (
 // TxKeySize is the size of the transaction key index
 const TxKeySize = sha256.Size
 
+var newline = []byte("\n")
+
 //--------------------------------------------------------------------------------
 
 // CListMempool is an ordered in-memory pool for transactions before they are
@@ -240,9 +242,6 @@ func (mem *CListMempool) CheckTx(tx types.Tx, cb func(*abci.Response), txInfo Tx
 		return err
 	}
 
-	// The size of the corresponding TxMessage
-	// can't be larger than the maxMsgSize, otherwise we can't
-	// relay it to peers.
 	if txSize > mem.config.MaxTxBytes {
 		return ErrTxTooLarge{mem.config.MaxTxBytes, txSize}
 	}
@@ -253,7 +252,23 @@ func (mem *CListMempool) CheckTx(tx types.Tx, cb func(*abci.Response), txInfo Tx
 		}
 	}
 
-	// CACHE
+	// NOTE: writing to the WAL and calling proxy must be done before adding tx
+	// to the cache. otherwise, if either of them fails, next time CheckTx is
+	// called with tx, ErrTxInCache will be returned without tx being checked at
+	// all even once.
+	if mem.wal != nil {
+		// TODO: Notify administrators when WAL fails
+		_, err := mem.wal.Write(append([]byte(tx), newline...))
+		if err != nil {
+			return fmt.Errorf("wal.Write: %w", err)
+		}
+	}
+
+	// NOTE: proxyAppConn may error if tx buffer is full
+	if err := mem.proxyAppConn.Error(); err != nil {
+		return err
+	}
+
 	if !mem.cache.Push(tx) {
 		// Record a new sender for a tx we've already seen.
 		// Note it's possible a tx is still in the cache but no longer in the mempool
@@ -265,30 +280,9 @@ func (mem *CListMempool) CheckTx(tx types.Tx, cb func(*abci.Response), txInfo Tx
 			// TODO: consider punishing peer for dups,
 			// its non-trivial since invalid txs can become valid,
 			// but they can spam the same tx with little cost to them atm.
-
 		}
 
 		return ErrTxInCache
-	}
-	// END CACHE
-
-	// WAL
-	if mem.wal != nil {
-		// TODO: Notify administrators when WAL fails
-		_, err := mem.wal.Write([]byte(tx))
-		if err != nil {
-			mem.logger.Error("Error writing to WAL", "err", err)
-		}
-		_, err = mem.wal.Write([]byte("\n"))
-		if err != nil {
-			mem.logger.Error("Error writing to WAL", "err", err)
-		}
-	}
-	// END WAL
-
-	// NOTE: proxyAppConn may error if tx buffer is full
-	if err := mem.proxyAppConn.Error(); err != nil {
-		return err
 	}
 
 	reqRes := mem.proxyAppConn.CheckTxAsync(abci.RequestCheckTx{Tx: tx})
@@ -523,21 +517,21 @@ func (mem *CListMempool) ReapMaxBytesMaxGas(maxBytes, maxGas int64) types.Txs {
 	mem.updateMtx.RLock()
 	defer mem.updateMtx.RUnlock()
 
-	var (
-		totalBytes int64
-		totalGas   int64
-	)
+	var totalGas int64
+
 	// TODO: we will get a performance boost if we have a good estimate of avg
 	// size per tx, and set the initial capacity based off of that.
 	// txs := make([]types.Tx, 0, tmmath.MinInt(mem.txs.Len(), max/mem.avgTxSize))
 	txs := make([]types.Tx, 0, mem.txs.Len())
 	for e := mem.txs.Front(); e != nil; e = e.Next() {
 		memTx := e.Value.(*mempoolTx)
+
+		dataSize := types.ComputeProtoSizeForTxs(append(txs, memTx.tx))
+
 		// Check total size requirement
-		if maxBytes > -1 && totalBytes+int64(len(memTx.tx)) > maxBytes {
+		if maxBytes > -1 && dataSize > maxBytes {
 			return txs
 		}
-		totalBytes += int64(len(memTx.tx))
 		// Check total gas requirement.
 		// If maxGas is negative, skip this check.
 		// Since newTotalGas < masGas, which

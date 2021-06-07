@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
 	dbm "github.com/mydexchain/tm-db"
@@ -29,9 +30,10 @@ import (
 	tmsync "github.com/mydexchain/tendermint/libs/sync"
 	mempl "github.com/mydexchain/tendermint/mempool"
 	"github.com/mydexchain/tendermint/p2p"
-	"github.com/mydexchain/tendermint/p2p/mock"
+	p2pmock "github.com/mydexchain/tendermint/p2p/mock"
 	tmproto "github.com/mydexchain/tendermint/proto/tendermint/types"
 	sm "github.com/mydexchain/tendermint/state"
+	statemocks "github.com/mydexchain/tendermint/state/mocks"
 	"github.com/mydexchain/tendermint/store"
 	"github.com/mydexchain/tendermint/types"
 )
@@ -63,8 +65,11 @@ func startConsensusNet(t *testing.T, css []*State, n int) (
 		require.NoError(t, err)
 		blocksSubs = append(blocksSubs, blocksSub)
 
-		if css[i].state.LastBlockHeight == 0 { //simulate handle initChain in handshake
-			sm.SaveState(css[i].blockExec.DB(), css[i].state)
+		if css[i].state.LastBlockHeight == 0 { // simulate handle initChain in handshake
+			if err := css[i].blockExec.Store().Save(css[i].state); err != nil {
+				t.Error(err)
+			}
+
 		}
 	}
 	// make connected switches and start all reactors
@@ -89,11 +94,15 @@ func stopConsensusNet(logger log.Logger, reactors []*Reactor, eventBuses []*type
 	logger.Info("stopConsensusNet", "n", len(reactors))
 	for i, r := range reactors {
 		logger.Info("stopConsensusNet: Stopping Reactor", "i", i)
-		r.Switch.Stop()
+		if err := r.Switch.Stop(); err != nil {
+			logger.Error("error trying to stop switch", "error", err)
+		}
 	}
 	for i, b := range eventBuses {
 		logger.Info("stopConsensusNet: Stopping eventBus", "i", i)
-		b.Stop()
+		if err := b.Stop(); err != nil {
+			logger.Error("error trying to stop eventbus", "error", err)
+		}
 	}
 	logger.Info("stopConsensusNet: DONE", "n", len(reactors))
 }
@@ -127,7 +136,8 @@ func TestReactorWithEvidence(t *testing.T) {
 	logger := consensusLogger()
 	for i := 0; i < nValidators; i++ {
 		stateDB := dbm.NewMemDB() // each state needs its own db
-		state, _ := sm.LoadStateFromDBOrGenesisDoc(stateDB, genDoc)
+		stateStore := sm.NewStore(stateDB)
+		state, _ := stateStore.LoadFromDBOrGenesisDoc(genDoc)
 		thisConfig := ResetConfig(fmt.Sprintf("%s_%d", testName, i))
 		defer os.RemoveAll(thisConfig.RootDir)
 		ensureDir(path.Dir(thisConfig.Consensus.WalFile()), 0700) // dir for wal
@@ -157,17 +167,25 @@ func TestReactorWithEvidence(t *testing.T) {
 		// mock the evidence pool
 		// everyone includes evidence of another double signing
 		vIdx := (i + 1) % nValidators
-		evpool := newMockEvidencePool(privVals[vIdx])
+		ev := types.NewMockDuplicateVoteEvidenceWithValidator(1, defaultTestTime, privVals[vIdx], config.ChainID())
+		evpool := &statemocks.EvidencePool{}
+		evpool.On("CheckEvidence", mock.AnythingOfType("types.EvidenceList")).Return(nil)
+		evpool.On("PendingEvidence", mock.AnythingOfType("int64")).Return([]types.Evidence{
+			ev}, int64(len(ev.Bytes())))
+		evpool.On("Update", mock.AnythingOfType("state.State"), mock.AnythingOfType("types.EvidenceList")).Return()
+
+		evpool2 := sm.EmptyEvidencePool{}
 
 		// Make State
-		blockExec := sm.NewBlockExecutor(stateDB, log.TestingLogger(), proxyAppConnCon, mempool, evpool)
-		cs := NewState(thisConfig.Consensus, state, blockExec, blockStore, mempool, evpool)
+		blockExec := sm.NewBlockExecutor(stateStore, log.TestingLogger(), proxyAppConnCon, mempool, evpool)
+		cs := NewState(thisConfig.Consensus, state, blockExec, blockStore, mempool, evpool2)
 		cs.SetLogger(log.TestingLogger().With("module", "consensus"))
 		cs.SetPrivValidator(pv)
 
 		eventBus := types.NewEventBus()
 		eventBus.SetLogger(log.TestingLogger().With("module", "events"))
-		eventBus.Start()
+		err := eventBus.Start()
+		require.NoError(t, err)
 		cs.SetEventBus(eventBus)
 
 		cs.SetTimeoutTicker(tickerFunc())
@@ -179,64 +197,15 @@ func TestReactorWithEvidence(t *testing.T) {
 	reactors, blocksSubs, eventBuses := startConsensusNet(t, css, nValidators)
 	defer stopConsensusNet(log.TestingLogger(), reactors, eventBuses)
 
-	// wait till everyone makes the first new block with no evidence
-	timeoutWaitGroup(t, nValidators, func(j int) {
-		msg := <-blocksSubs[j].Out()
-		block := msg.Data().(types.EventDataNewBlock).Block
-		assert.True(t, len(block.Evidence.Evidence) == 0)
-	}, css)
-
-	// second block should have evidence
-	timeoutWaitGroup(t, nValidators, func(j int) {
-		msg := <-blocksSubs[j].Out()
-		block := msg.Data().(types.EventDataNewBlock).Block
-		assert.True(t, len(block.Evidence.Evidence) > 0)
-	}, css)
-}
-
-// mock evidence pool returns no evidence for block 1,
-// and returnes one piece for all higher blocks. The one piece
-// is for a given validator at block 1.
-type mockEvidencePool struct {
-	height int
-	ev     []types.Evidence
-}
-
-func newMockEvidencePool(val types.PrivValidator) *mockEvidencePool {
-	return &mockEvidencePool{
-		ev: []types.Evidence{types.NewMockDuplicateVoteEvidenceWithValidator(1, defaultTestTime, val, config.ChainID())},
+	// we expect for each validator that is the proposer to propose one piece of evidence.
+	for i := 0; i < nValidators; i++ {
+		timeoutWaitGroup(t, nValidators, func(j int) {
+			msg := <-blocksSubs[j].Out()
+			block := msg.Data().(types.EventDataNewBlock).Block
+			assert.Len(t, block.Evidence.Evidence, 1)
+		}, css)
 	}
 }
-
-// NOTE: maxBytes is ignored
-func (m *mockEvidencePool) PendingEvidence(maxBytes uint32) []types.Evidence {
-	if m.height > 0 {
-		return m.ev
-	}
-	return nil
-}
-func (m *mockEvidencePool) AddEvidence(types.Evidence) error { return nil }
-func (m *mockEvidencePool) Update(block *types.Block, state sm.State) {
-	if m.height > 0 {
-		if len(block.Evidence.Evidence) == 0 {
-			panic("block has no evidence")
-		}
-	}
-	m.height++
-}
-func (m *mockEvidencePool) IsCommitted(types.Evidence) bool { return false }
-func (m *mockEvidencePool) IsPending(evidence types.Evidence) bool {
-	if m.height > 0 {
-		for _, e := range m.ev {
-			if e.Equal(evidence) {
-				return true
-			}
-		}
-	}
-	return false
-}
-func (m *mockEvidencePool) AddPOLC(*types.ProofOfLockChange) error { return nil }
-func (m *mockEvidencePool) Header(int64) *types.Header             { return &types.Header{Time: defaultTestTime} }
 
 //------------------------------------
 
@@ -271,7 +240,7 @@ func TestReactorReceiveDoesNotPanicIfAddPeerHasntBeenCalledYet(t *testing.T) {
 
 	var (
 		reactor = reactors[0]
-		peer    = mock.NewPeer(nil)
+		peer    = p2pmock.NewPeer(nil)
 		msg     = MustEncode(&HasVoteMessage{Height: 1,
 			Round: 1, Index: 1, Type: tmproto.PrevoteType})
 	)
@@ -294,7 +263,7 @@ func TestReactorReceivePanicsIfInitPeerHasntBeenCalledYet(t *testing.T) {
 
 	var (
 		reactor = reactors[0]
-		peer    = mock.NewPeer(nil)
+		peer    = p2pmock.NewPeer(nil)
 		msg     = MustEncode(&HasVoteMessage{Height: 1,
 			Round: 1, Index: 1, Type: tmproto.PrevoteType})
 	)
@@ -670,7 +639,7 @@ func timeoutWaitGroup(t *testing.T, n int, f func(int), css []*State) {
 
 	// we're running many nodes in-process, possibly in in a virtual machine,
 	// and spewing debug messages - making a block could take a while,
-	timeout := time.Second * 300
+	timeout := time.Second * 120
 
 	select {
 	case <-done:
@@ -682,7 +651,8 @@ func timeoutWaitGroup(t *testing.T, n int, f func(int), css []*State) {
 			t.Log("")
 		}
 		os.Stdout.Write([]byte("pprof.Lookup('goroutine'):\n"))
-		pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
+		err := pprof.Lookup("goroutine").WriteTo(os.Stdout, 1)
+		require.NoError(t, err)
 		capture()
 		panic("Timed out waiting for all validators to commit a block")
 	}

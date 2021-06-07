@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"path/filepath"
+	"strings"
 	"text/template"
 
 	tmos "github.com/mydexchain/tendermint/libs/os"
@@ -17,7 +18,10 @@ var configTemplate *template.Template
 
 func init() {
 	var err error
-	if configTemplate, err = template.New("configFileTemplate").Parse(defaultConfigTemplate); err != nil {
+	tmpl := template.New("configFileTemplate").Funcs(template.FuncMap{
+		"StringsJoin": strings.Join,
+	})
+	if configTemplate, err = tmpl.Parse(defaultConfigTemplate); err != nil {
 		panic(err)
 	}
 }
@@ -139,9 +143,6 @@ node_key_file = "{{ js .BaseConfig.NodeKey }}"
 # Mechanism to connect to the ABCI application: socket | grpc
 abci = "{{ .BaseConfig.ABCI }}"
 
-# TCP or UNIX socket address for the profiling server to listen on
-prof_laddr = "{{ .BaseConfig.ProfListenAddress }}"
-
 # If true, query the ABCI app on connecting to a new peer
 # so the app can decide if we should keep the connection or not
 filter_peers = {{ .BaseConfig.FilterPeers }}
@@ -231,6 +232,9 @@ tls_cert_file = "{{ .RPC.TLSCertFile }}"
 # NOTE: both tls_cert_file and tls_key_file must be present for Tendermint to create HTTPS server.
 # Otherwise, HTTP server is run.
 tls_key_file = "{{ .RPC.TLSKeyFile }}"
+
+# pprof listen address (https://golang.org/pkg/net/http/pprof)
+pprof_laddr = "{{ .RPC.PprofListenAddress }}"
 
 #######################################################
 ###           P2P Configuration Options             ###
@@ -329,6 +333,10 @@ cache_size = {{ .Mempool.CacheSize }}
 # NOTE: the max size of a tx transmitted over the network is {max_tx_bytes}.
 max_tx_bytes = {{ .Mempool.MaxTxBytes }}
 
+# Maximum size of a batch of transactions to send to a peer
+# Including space needed by encoding (one varint per transaction).
+max_batch_bytes = {{ .Mempool.MaxBatchBytes }}
+
 #######################################################
 ###         State Sync Configuration Options        ###
 #######################################################
@@ -346,10 +354,13 @@ enable = {{ .StateSync.Enable }}
 #
 # For Chain SDK-based chains, trust_period should usually be about 2/3 of the unbonding time (~2
 # weeks) during which they can be financially punished (slashed) for misbehavior.
-rpc_servers = ""
+rpc_servers = "{{ StringsJoin .StateSync.RPCServers "," }}"
 trust_height = {{ .StateSync.TrustHeight }}
 trust_hash = "{{ .StateSync.TrustHash }}"
 trust_period = "{{ .StateSync.TrustPeriod }}"
+
+# Time to spend discovering snapshots before initiating a restore.
+discovery_time = "{{ .StateSync.DiscoveryTime }}"
 
 # Temporary directory for state sync snapshot chunks, defaults to the OS tempdir (typically /tmp).
 # Will create a new, randomly named directory within, and remove it when done.
@@ -363,7 +374,7 @@ temp_dir = "{{ .StateSync.TempDir }}"
 # Fast Sync version to use:
 #   1) "v0" (default) - the legacy fast sync implementation
 #   2) "v1" - refactor of v0 version for better testability
-#   2) "v2" - complete redesign of v0, optimized for testability & readability 
+#   2) "v2" - complete redesign of v0, optimized for testability & readability
 version = "{{ .FastSync.Version }}"
 
 #######################################################
@@ -373,13 +384,28 @@ version = "{{ .FastSync.Version }}"
 
 wal_file = "{{ js .Consensus.WalPath }}"
 
+# How long we wait for a proposal block before prevoting nil
 timeout_propose = "{{ .Consensus.TimeoutPropose }}"
+# How much timeout_propose increases with each round
 timeout_propose_delta = "{{ .Consensus.TimeoutProposeDelta }}"
+# How long we wait after receiving +2/3 prevotes for “anything” (ie. not a single block or nil)
 timeout_prevote = "{{ .Consensus.TimeoutPrevote }}"
+# How much the timeout_prevote increases with each round
 timeout_prevote_delta = "{{ .Consensus.TimeoutPrevoteDelta }}"
+# How long we wait after receiving +2/3 precommits for “anything” (ie. not a single block or nil)
 timeout_precommit = "{{ .Consensus.TimeoutPrecommit }}"
+# How much the timeout_precommit increases with each round
 timeout_precommit_delta = "{{ .Consensus.TimeoutPrecommitDelta }}"
+# How long we wait after committing a block, before starting on the new
+# height (this gives us a chance to receive some more precommits, even
+# though we already have +2/3).
 timeout_commit = "{{ .Consensus.TimeoutCommit }}"
+
+# How many blocks to look back to check existence of the node's consensus votes before joining consensus
+# When non-zero, the node will panic upon restart
+# if the same consensus key was used to sign {double_sign_check_height} last blocks.
+# So, validators should stop the state machine, wait for some blocks, and then restart the state machine to avoid panic.
+double_sign_check_height = {{ .Consensus.DoubleSignCheckHeight }}
 
 # Make progress as soon as we have all the precommits (as if TimeoutCommit = 0)
 skip_timeout_commit = {{ .Consensus.SkipTimeoutCommit }}
@@ -398,7 +424,7 @@ peer_query_maj23_sleep_duration = "{{ .Consensus.PeerQueryMaj23SleepDuration }}"
 [tx_index]
 
 # What indexer to use for transactions
-# 
+#
 # The application will set which txs to index. In some cases a node operator will be able
 # to decide which txs to index based on configuration set in the application.
 #
@@ -480,6 +506,24 @@ var testGenesisFmt = `{
   "genesis_time": "2018-10-10T08:20:13.695936996Z",
   "chain_id": "%s",
   "initial_height": "1",
+	"consensus_params": {
+		"block": {
+			"max_bytes": "22020096",
+			"max_gas": "-1",
+			"time_iota_ms": "10"
+		},
+		"evidence": {
+			"max_age_num_blocks": "100000",
+			"max_age_duration": "172800000000000",
+			"max_bytes": "1048576"
+		},
+		"validator": {
+			"pub_key_types": [
+				"ed25519"
+			]
+		},
+		"version": {}
+	},
   "validators": [
     {
       "pub_key": {

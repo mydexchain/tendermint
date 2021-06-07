@@ -11,6 +11,7 @@ import (
 	"github.com/mydexchain/tendermint/crypto"
 	"github.com/mydexchain/tendermint/crypto/tmhash"
 	tmrand "github.com/mydexchain/tendermint/libs/rand"
+	cryptoproto "github.com/mydexchain/tendermint/proto/tendermint/crypto"
 	privvalproto "github.com/mydexchain/tendermint/proto/tendermint/privval"
 	tmproto "github.com/mydexchain/tendermint/proto/tendermint/types"
 	"github.com/mydexchain/tendermint/types"
@@ -33,7 +34,7 @@ func getSignerTestCases(t *testing.T) []signerTestCase {
 
 		// get a pair of signer listener, signer dialer endpoints
 		sl, sd := getMockEndpoints(t, dtc.addr, dtc.dialer)
-		sc, err := NewSignerClient(sl)
+		sc, err := NewSignerClient(sl, chainID)
 		require.NoError(t, err)
 		ss := NewSignerServer(sd, chainID, mockPV)
 
@@ -396,11 +397,11 @@ func brokenHandler(privVal types.PrivValidator, request privvalproto.Message,
 	switch r := request.Sum.(type) {
 	// This is broken and will answer most requests with a pubkey response
 	case *privvalproto.Message_PubKeyRequest:
-		res = mustWrapMsg(&privvalproto.PubKeyResponse{PubKey: nil, Error: nil})
+		res = mustWrapMsg(&privvalproto.PubKeyResponse{PubKey: cryptoproto.PublicKey{}, Error: nil})
 	case *privvalproto.Message_SignVoteRequest:
-		res = mustWrapMsg(&privvalproto.PubKeyResponse{PubKey: nil, Error: nil})
+		res = mustWrapMsg(&privvalproto.PubKeyResponse{PubKey: cryptoproto.PublicKey{}, Error: nil})
 	case *privvalproto.Message_SignProposalRequest:
-		res = mustWrapMsg(&privvalproto.PubKeyResponse{PubKey: nil, Error: nil})
+		res = mustWrapMsg(&privvalproto.PubKeyResponse{PubKey: cryptoproto.PublicKey{}, Error: nil})
 	case *privvalproto.Message_PingRequest:
 		err, res = nil, mustWrapMsg(&privvalproto.PingResponse{})
 	default:

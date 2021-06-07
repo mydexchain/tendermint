@@ -1,13 +1,11 @@
 package types
 
 import (
-	"fmt"
-	"reflect"
-
 	abci "github.com/mydexchain/tendermint/abci/types"
 	"github.com/mydexchain/tendermint/crypto"
 	"github.com/mydexchain/tendermint/crypto/ed25519"
 	cryptoenc "github.com/mydexchain/tendermint/crypto/encoding"
+	"github.com/mydexchain/tendermint/crypto/secp256k1"
 	tmproto "github.com/mydexchain/tendermint/proto/tendermint/types"
 )
 
@@ -15,19 +13,15 @@ import (
 // Use strings to distinguish types in ABCI messages
 
 const (
-	ABCIEvidenceTypeDuplicateVote = "duplicate/vote"
-	ABCIEvidenceTypeLunatic       = "lunatic"
-	ABCIEvidenceTypeAmnesia       = "amnesia"
-)
-
-const (
-	ABCIPubKeyTypeEd25519 = "ed25519"
+	ABCIPubKeyTypeEd25519   = ed25519.KeyType
+	ABCIPubKeyTypeSecp256k1 = secp256k1.KeyType
 )
 
 // TODO: Make non-global by allowing for registration of more pubkey types
 
 var ABCIPubKeyTypesToNames = map[string]string{
-	ABCIPubKeyTypeEd25519: ed25519.PubKeyName,
+	ABCIPubKeyTypeEd25519:   ed25519.PubKeyName,
+	ABCIPubKeyTypeSecp256k1: secp256k1.PubKeyName,
 }
 
 //-------------------------------------------------------
@@ -111,39 +105,6 @@ func (tm2pb) ConsensusParams(params *tmproto.ConsensusParams) *abci.ConsensusPar
 		},
 		Evidence:  &params.Evidence,
 		Validator: &params.Validator,
-	}
-}
-
-// ABCI Evidence includes information from the past that's not included in the evidence itself
-// so Evidence types stays compact.
-// XXX: panics on nil or unknown pubkey type
-func (tm2pb) Evidence(ev Evidence, valSet *ValidatorSet) abci.Evidence {
-	addr := ev.Address()
-	_, val := valSet.GetByAddress(addr)
-	if val == nil {
-		// should already have checked this
-		panic(fmt.Sprintf("validator in evidence is not in val set, val addr: %v", addr))
-	}
-
-	// set type
-	var evType string
-	switch ev.(type) {
-	case *DuplicateVoteEvidence:
-		evType = ABCIEvidenceTypeDuplicateVote
-	case *LunaticValidatorEvidence:
-		evType = ABCIEvidenceTypeLunatic
-	case *AmnesiaEvidence:
-		evType = ABCIEvidenceTypeAmnesia
-	default:
-		panic(fmt.Sprintf("unknown evidence type: %v %v", ev, reflect.TypeOf(ev)))
-	}
-
-	return abci.Evidence{
-		Type:             evType,
-		Validator:        TM2PB.Validator(val),
-		Height:           ev.Height(),
-		Time:             ev.Time(),
-		TotalVotingPower: valSet.TotalVotingPower(),
 	}
 }
 

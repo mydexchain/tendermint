@@ -12,19 +12,29 @@ import (
 	"golang.org/x/crypto/ripemd160" // nolint: staticcheck // necessary for Bitcoin address format
 
 	"github.com/mydexchain/tendermint/crypto"
+	tmjson "github.com/mydexchain/tendermint/libs/json"
 )
+
+//-------------------------------------
+const (
+	PrivKeyName = "tendermint/PrivKeySecp256k1"
+	PubKeyName  = "tendermint/PubKeySecp256k1"
+
+	KeyType     = "secp256k1"
+	PrivKeySize = 32
+)
+
+func init() {
+	tmjson.RegisterType(PubKey{}, PubKeyName)
+	tmjson.RegisterType(PrivKey{}, PrivKeyName)
+}
 
 var _ crypto.PrivKey = PrivKey{}
-
-const (
-	PrivKeySize = 32
-	keyType     = "secp256k1"
-)
 
 // PrivKey implements PrivKey.
 type PrivKey []byte
 
-// Bytes returns the byte representation of the Private Key.
+// Bytes marshalls the private key using amino encoding.
 func (privKey PrivKey) Bytes() []byte {
 	return []byte(privKey)
 }
@@ -33,7 +43,10 @@ func (privKey PrivKey) Bytes() []byte {
 // generator point to get the pubkey.
 func (privKey PrivKey) PubKey() crypto.PubKey {
 	_, pubkeyObject := secp256k1.PrivKeyFromBytes(secp256k1.S256(), privKey)
-	return PubKey(pubkeyObject.SerializeCompressed())
+
+	pk := pubkeyObject.SerializeCompressed()
+
+	return PubKey(pk)
 }
 
 // Equals - you probably don't need to use this.
@@ -46,7 +59,7 @@ func (privKey PrivKey) Equals(other crypto.PrivKey) bool {
 }
 
 func (privKey PrivKey) Type() string {
-	return keyType
+	return KeyType
 }
 
 // GenPrivKey generates a new ECDSA private key on curve secp256k1 private key.
@@ -59,6 +72,7 @@ func GenPrivKey() PrivKey {
 func genPrivKey(rand io.Reader) PrivKey {
 	var privKeyBytes [PrivKeySize]byte
 	d := new(big.Int)
+
 	for {
 		privKeyBytes = [PrivKeySize]byte{}
 		_, err := io.ReadFull(rand, privKeyBytes[:])
@@ -79,7 +93,7 @@ func genPrivKey(rand io.Reader) PrivKey {
 
 var one = new(big.Int).SetInt64(1)
 
-// GenPrivKeyFromSecret hashes the secret with SHA2, and uses
+// GenPrivKeySecp256k1 hashes the secret with SHA2, and uses
 // that 32 byte output to create the private key.
 //
 // It makes sure the private key is a valid field element by setting:
@@ -89,7 +103,7 @@ var one = new(big.Int).SetInt64(1)
 //
 // NOTE: secret should be the output of a KDF like bcrypt,
 // if it's derived from user input.
-func GenPrivKeyFromSecret(secret []byte) PrivKey {
+func GenPrivKeySecp256k1(secret []byte) PrivKey {
 	secHash := sha256.Sum256(secret)
 	// to guarantee that we have a valid field element, we use the approach of:
 	// "Suite B Implementer’s Guide to FIPS 186-3", A.2.1
@@ -128,27 +142,23 @@ func (pubKey PubKey) Address() crypto.Address {
 	if len(pubKey) != PubKeySize {
 		panic("length of pubkey is incorrect")
 	}
-
 	hasherSHA256 := sha256.New()
-	hasherSHA256.Write(pubKey) // does not error
+	_, _ = hasherSHA256.Write(pubKey) // does not error
 	sha := hasherSHA256.Sum(nil)
 
 	hasherRIPEMD160 := ripemd160.New()
-	hasherRIPEMD160.Write(sha) // does not error
+	_, _ = hasherRIPEMD160.Write(sha) // does not error
+
 	return crypto.Address(hasherRIPEMD160.Sum(nil))
 }
 
-// Bytes returns the pubkey byte format.
+// Bytes returns the pubkey marshalled with amino encoding.
 func (pubKey PubKey) Bytes() []byte {
 	return []byte(pubKey)
 }
 
 func (pubKey PubKey) String() string {
-	return fmt.Sprintf("PubKeySecp256k1{%X}", []byte(pubKey))
-}
-
-func (pubKey PubKey) Type() string {
-	return keyType
+	return fmt.Sprintf("PubKeySecp256k1{%X}", pubKey[:])
 }
 
 func (pubKey PubKey) Equals(other crypto.PubKey) bool {
@@ -156,4 +166,8 @@ func (pubKey PubKey) Equals(other crypto.PubKey) bool {
 		return bytes.Equal(pubKey[:], otherSecp[:])
 	}
 	return false
+}
+
+func (pubKey PubKey) Type() string {
+	return KeyType
 }

@@ -14,7 +14,6 @@ import (
 	cryptoenc "github.com/mydexchain/tendermint/crypto/encoding"
 	"github.com/mydexchain/tendermint/libs/log"
 	pc "github.com/mydexchain/tendermint/proto/tendermint/crypto"
-	tmtypes "github.com/mydexchain/tendermint/types"
 )
 
 const (
@@ -127,7 +126,7 @@ func (app *PersistentKVStoreApplication) BeginBlock(req types.RequestBeginBlock)
 
 	// Punish validators who committed equivocation.
 	for _, ev := range req.ByzantineValidators {
-		if ev.Type == tmtypes.ABCIEvidenceTypeDuplicateVote {
+		if ev.Type == types.EvidenceType_DUPLICATE_VOTE {
 			addr := string(ev.Validator.Address)
 			if pubKey, ok := app.valAddrToPubKeyMap[addr]; ok {
 				app.updateValidator(types.ValidatorUpdate{
@@ -213,7 +212,7 @@ func isValidatorTx(tx []byte) bool {
 func (app *PersistentKVStoreApplication) execValidatorTx(tx []byte) types.ResponseDeliverTx {
 	tx = tx[len(ValidatorSetChangePrefix):]
 
-	//get the pubkey and power
+	//  get the pubkey and power
 	pubKeyAndPower := strings.Split(string(tx), "!")
 	if len(pubKeyAndPower) != 2 {
 		return types.ResponseDeliverTx{
@@ -244,11 +243,11 @@ func (app *PersistentKVStoreApplication) execValidatorTx(tx []byte) types.Respon
 
 // add, update, or remove a validator
 func (app *PersistentKVStoreApplication) updateValidator(v types.ValidatorUpdate) types.ResponseDeliverTx {
-	key := []byte("val:" + string(v.PubKey.GetEd25519()))
 	pubkey, err := cryptoenc.PubKeyFromProto(v.PubKey)
 	if err != nil {
 		panic(fmt.Errorf("can't decode public key: %w", err))
 	}
+	key := []byte("val:" + string(pubkey.Bytes()))
 
 	if v.Power == 0 {
 		// remove validator

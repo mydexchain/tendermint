@@ -18,6 +18,7 @@ type BlockStore interface {
 	Height() int64
 	Size() int64
 
+	LoadBaseMeta() *types.BlockMeta
 	LoadBlockMeta(height int64) *types.BlockMeta
 	LoadBlock(height int64) *types.Block
 
@@ -35,25 +36,26 @@ type BlockStore interface {
 //-----------------------------------------------------------------------------
 // evidence pool
 
-//go:generate mockery -case underscore -name EvidencePool
+//go:generate mockery --case underscore --name EvidencePool
 
-// EvidencePool defines the EvidencePool interface used by the ConsensusState.
-// Get/Set/Commit
+// EvidencePool defines the EvidencePool interface used by State.
 type EvidencePool interface {
-	PendingEvidence(uint32) []types.Evidence
+	PendingEvidence(maxBytes int64) (ev []types.Evidence, size int64)
 	AddEvidence(types.Evidence) error
-	Update(*types.Block, State)
-	IsCommitted(types.Evidence) bool
-	IsPending(types.Evidence) bool
-	Header(int64) *types.Header
+	Update(State, types.EvidenceList)
+	CheckEvidence(types.EvidenceList) error
 }
 
-// MockEvidencePool is an empty implementation of EvidencePool, useful for testing.
-type MockEvidencePool struct{}
+// EmptyEvidencePool is an empty implementation of EvidencePool, useful for testing. It also complies
+// to the consensus evidence pool interface
+type EmptyEvidencePool struct{}
 
-func (me MockEvidencePool) PendingEvidence(uint32) []types.Evidence { return nil }
-func (me MockEvidencePool) AddEvidence(types.Evidence) error        { return nil }
-func (me MockEvidencePool) Update(*types.Block, State)              {}
-func (me MockEvidencePool) IsCommitted(types.Evidence) bool         { return false }
-func (me MockEvidencePool) IsPending(types.Evidence) bool           { return false }
-func (me MockEvidencePool) Header(int64) *types.Header              { return nil }
+func (EmptyEvidencePool) PendingEvidence(maxBytes int64) (ev []types.Evidence, size int64) {
+	return nil, 0
+}
+func (EmptyEvidencePool) AddEvidence(types.Evidence) error              { return nil }
+func (EmptyEvidencePool) Update(State, types.EvidenceList)              {}
+func (EmptyEvidencePool) CheckEvidence(evList types.EvidenceList) error { return nil }
+func (EmptyEvidencePool) AddEvidenceFromConsensus(evidence types.Evidence) error {
+	return nil
+}

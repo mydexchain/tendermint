@@ -3,6 +3,7 @@ package statesync
 import (
 	"errors"
 	"sort"
+	"time"
 
 	abci "github.com/mydexchain/tendermint/abci/types"
 	tmsync "github.com/mydexchain/tendermint/libs/sync"
@@ -245,7 +246,7 @@ func (r *Reactor) recentSnapshots(n uint32) ([]*snapshot, error) {
 
 // Sync runs a state sync, returning the new state and last commit at the snapshot height.
 // The caller must store the state and commit in the state database and block store.
-func (r *Reactor) Sync(stateProvider StateProvider) (sm.State, *types.Commit, error) {
+func (r *Reactor) Sync(stateProvider StateProvider, discoveryTime time.Duration) (sm.State, *types.Commit, error) {
 	r.mtx.Lock()
 	if r.syncer != nil {
 		r.mtx.Unlock()
@@ -254,7 +255,11 @@ func (r *Reactor) Sync(stateProvider StateProvider) (sm.State, *types.Commit, er
 	r.syncer = newSyncer(r.Logger, r.conn, r.connQuery, stateProvider, r.tempDir)
 	r.mtx.Unlock()
 
-	state, commit, err := r.syncer.SyncAny(defaultDiscoveryTime)
+	// Request snapshots from all currently connected peers
+	r.Logger.Debug("Requesting snapshots from known peers")
+	r.Switch.Broadcast(SnapshotChannel, mustEncodeMsg(&ssproto.SnapshotsRequest{}))
+
+	state, commit, err := r.syncer.SyncAny(discoveryTime)
 	r.mtx.Lock()
 	r.syncer = nil
 	r.mtx.Unlock()

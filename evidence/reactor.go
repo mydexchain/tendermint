@@ -4,12 +4,9 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/gogo/protobuf/proto"
-
 	clist "github.com/mydexchain/tendermint/libs/clist"
 	"github.com/mydexchain/tendermint/libs/log"
 	"github.com/mydexchain/tendermint/p2p"
-	ep "github.com/mydexchain/tendermint/proto/tendermint/evidence"
 	tmproto "github.com/mydexchain/tendermint/proto/tendermint/types"
 	"github.com/mydexchain/tendermint/types"
 )
@@ -19,8 +16,13 @@ const (
 
 	maxMsgSize = 1048576 // 1MB TODO make it configurable
 
-	broadcastEvidenceIntervalS = 60  // broadcast uncommitted evidence this often
-	peerCatchupSleepIntervalMS = 100 // If peer is behind, sleep this amount
+	// broadcast all uncommitted evidence this often. This sets when the reactor
+	// goes back to the start of the list and begins sending the evidence again.
+	// Most evidence should be committed in the very next block that is why we wait
+	// just over the block production rate before sending evidence again.
+	broadcastEvidenceIntervalS = 10
+	// If a message fails wait this much before sending it again
+	peerRetryMessageIntervalMS = 100
 )
 
 // Reactor handles evpool evidence broadcasting amongst peers.
@@ -75,7 +77,7 @@ func (evR *Reactor) Receive(chID byte, src p2p.Peer, msgBytes []byte) {
 	for _, ev := range evis {
 		err := evR.evpool.AddEvidence(ev)
 		switch err.(type) {
-		case *types.ErrEvidenceInvalid:
+		case *types.ErrInvalidEvidence:
 			evR.Logger.Error(err.Error())
 			// punish peer
 			evR.Switch.StopPeerForError(src, err)
@@ -119,20 +121,18 @@ func (evR *Reactor) broadcastEvidenceRoutine(peer p2p.Peer) {
 		}
 
 		ev := next.Value.(types.Evidence)
-		evis, retry := evR.checkSendEvidenceMessage(peer, ev)
+		evis := evR.prepareEvidenceMessage(peer, ev)
 		if len(evis) > 0 {
 			msgBytes, err := encodeMsg(evis)
 			if err != nil {
 				panic(err)
 			}
-
+			evR.Logger.Debug("Gossiping evidence to peer", "ev", ev, "peer", peer.ID())
 			success := peer.Send(EvidenceChannel, msgBytes)
-			retry = !success
-		}
-
-		if retry {
-			time.Sleep(peerCatchupSleepIntervalMS * time.Millisecond)
-			continue
+			if !success {
+				time.Sleep(peerRetryMessageIntervalMS * time.Millisecond)
+				continue
+			}
 		}
 
 		afterCh := time.After(time.Second * broadcastEvidenceIntervalS)
@@ -152,12 +152,12 @@ func (evR *Reactor) broadcastEvidenceRoutine(peer p2p.Peer) {
 	}
 }
 
-// Returns the message to send the peer, or nil if the evidence is invalid for the peer.
-// If message is nil, return true if we should sleep and try again.
-func (evR Reactor) checkSendEvidenceMessage(
+// Returns the message to send to the peer, or nil if the evidence is invalid for the peer.
+// If message is nil, we should sleep and try again.
+func (evR Reactor) prepareEvidenceMessage(
 	peer p2p.Peer,
 	ev types.Evidence,
-) (evis []types.Evidence, retry bool) {
+) (evis []types.Evidence) {
 
 	// make sure the peer is up to date
 	evHeight := ev.Height()
@@ -168,26 +168,20 @@ func (evR Reactor) checkSendEvidenceMessage(
 		// different every time due to us using a map. Sometimes other reactors
 		// will be initialized before the consensus reactor. We should wait a few
 		// milliseconds and retry.
-		return nil, true
+		return nil
 	}
 
 	// NOTE: We only send evidence to peers where
 	// peerHeight - maxAge < evidenceHeight < peerHeight
-	// and
-	// lastBlockTime - maxDuration < evidenceTime
 	var (
-		peerHeight = peerState.GetHeight()
-
-		params = evR.evpool.State().ConsensusParams.Evidence
-
-		ageDuration  = evR.evpool.State().LastBlockTime.Sub(ev.Time())
+		peerHeight   = peerState.GetHeight()
+		params       = evR.evpool.State().ConsensusParams.Evidence
 		ageNumBlocks = peerHeight - evHeight
 	)
 
-	if peerHeight < evHeight { // peer is behind. sleep while he catches up
-		return nil, true
-	} else if ageNumBlocks > params.MaxAgeNumBlocks &&
-		ageDuration > params.MaxAgeDuration { // evidence is too old, skip
+	if peerHeight <= evHeight { // peer is behind. sleep while he catches up
+		return nil
+	} else if ageNumBlocks > params.MaxAgeNumBlocks { // evidence is too old relative to the peer, skip
 
 		// NOTE: if evidence is too old for an honest peer, then we're behind and
 		// either it already got committed or it never will!
@@ -196,16 +190,15 @@ func (evR Reactor) checkSendEvidenceMessage(
 			"evHeight", evHeight,
 			"maxAgeNumBlocks", params.MaxAgeNumBlocks,
 			"lastBlockTime", evR.evpool.State().LastBlockTime,
-			"evTime", ev.Time(),
 			"maxAgeDuration", params.MaxAgeDuration,
 			"peer", peer,
 		)
 
-		return nil, false
+		return nil
 	}
 
 	// send evidence
-	return []types.Evidence{ev}, false
+	return []types.Evidence{ev}
 }
 
 // PeerState describes the state of a peer.
@@ -216,31 +209,32 @@ type PeerState interface {
 // encodemsg takes a array of evidence
 // returns the byte encoding of the List Message
 func encodeMsg(evis []types.Evidence) ([]byte, error) {
-	evi := make([]*tmproto.Evidence, len(evis))
+	evi := make([]tmproto.Evidence, len(evis))
 	for i := 0; i < len(evis); i++ {
 		ev, err := types.EvidenceToProto(evis[i])
 		if err != nil {
 			return nil, err
 		}
-		evi[i] = ev
+		evi[i] = *ev
 	}
-
-	epl := ep.List{
+	epl := tmproto.EvidenceList{
 		Evidence: evi,
 	}
 
-	return proto.Marshal(&epl)
+	return epl.Marshal()
 }
 
 // decodemsg takes an array of bytes
 // returns an array of evidence
 func decodeMsg(bz []byte) (evis []types.Evidence, err error) {
-	lm := ep.List{}
-	proto.Unmarshal(bz, &lm)
+	lm := tmproto.EvidenceList{}
+	if err := lm.Unmarshal(bz); err != nil {
+		return nil, err
+	}
 
 	evis = make([]types.Evidence, len(lm.Evidence))
 	for i := 0; i < len(lm.Evidence); i++ {
-		ev, err := types.EvidenceFromProto(lm.Evidence[i])
+		ev, err := types.EvidenceFromProto(&lm.Evidence[i])
 		if err != nil {
 			return nil, err
 		}

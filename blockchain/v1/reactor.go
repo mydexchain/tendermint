@@ -84,6 +84,9 @@ func NewBlockchainReactor(state sm.State, blockExec *sm.BlockExecutor, store *st
 	errorsForFSMCh := make(chan bcReactorMessage, capacity)
 
 	startHeight := store.Height() + 1
+	if startHeight == 1 {
+		startHeight = state.InitialHeight
+	}
 	bcR := &BlockchainReactor{
 		initialState:     state,
 		state:            state,
@@ -97,7 +100,7 @@ func NewBlockchainReactor(state sm.State, blockExec *sm.BlockExecutor, store *st
 	fsm := NewFSM(startHeight, bcR)
 	bcR.fsm = fsm
 	bcR.BaseReactor = *p2p.NewBaseReactor("BlockchainReactor", bcR)
-	//bcR.swReporter = behaviour.NewSwitchReporter(bcR.BaseReactor.Switch)
+	// bcR.swReporter = behaviour.NewSwitchReporter(bcR.BaseReactor.Switch)
 
 	return bcR
 }
@@ -295,6 +298,16 @@ func (bcR *BlockchainReactor) Receive(chID byte, src p2p.Peer, msgBytes []byte) 
 		}
 		bcR.Logger.Info("Received", "src", src, "height", bi.Height)
 		bcR.messagesForFSMCh <- msgForFSM
+	case *bcproto.NoBlockResponse:
+		msgForFSM := bcReactorMessage{
+			event: noBlockResponseEv,
+			data: bReactorEventData{
+				peerID: src.ID(),
+				height: msg.Height,
+			},
+		}
+		bcR.Logger.Debug("Peer does not have requested block", "peer", src, "height", msg.Height)
+		bcR.messagesForFSMCh <- msgForFSM
 
 	case *bcproto.StatusResponse:
 		// Got a peer status. Unverified.
@@ -460,7 +473,7 @@ func (bcR *BlockchainReactor) processBlock() error {
 	// NOTE: we can probably make this more efficient, but note that calling
 	// first.Hash() doesn't verify the tx contents, so MakePartSet() is
 	// currently necessary.
-	err = bcR.state.Validators.VerifyCommit(chainID, firstID, first.Height, second.LastCommit)
+	err = bcR.state.Validators.VerifyCommitLight(chainID, firstID, first.Height, second.LastCommit)
 	if err != nil {
 		bcR.Logger.Error("error during commit verification", "err", err,
 			"first", first.Height, "second", second.Height)

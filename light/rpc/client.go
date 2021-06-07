@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
 
 	"github.com/gogo/protobuf/proto"
@@ -13,8 +12,8 @@ import (
 	abci "github.com/mydexchain/tendermint/abci/types"
 	"github.com/mydexchain/tendermint/crypto/merkle"
 	tmbytes "github.com/mydexchain/tendermint/libs/bytes"
+	tmmath "github.com/mydexchain/tendermint/libs/math"
 	service "github.com/mydexchain/tendermint/libs/service"
-	light "github.com/mydexchain/tendermint/light"
 	rpcclient "github.com/mydexchain/tendermint/rpc/client"
 	ctypes "github.com/mydexchain/tendermint/rpc/core/types"
 	rpctypes "github.com/mydexchain/tendermint/rpc/jsonrpc/types"
@@ -23,26 +22,54 @@ import (
 
 var errNegOrZeroHeight = errors.New("negative or zero height")
 
-// Client is an RPC client, which uses light#Client to verify data (if it can be
-// proved!).
+// KeyPathFunc builds a merkle path out of the given path and key.
+type KeyPathFunc func(path string, key []byte) (merkle.KeyPath, error)
+
+// LightClient is an interface that contains functionality needed by Client from the light client.
+type LightClient interface {
+	ChainID() string
+	VerifyLightBlockAtHeight(ctx context.Context, height int64, now time.Time) (*types.LightBlock, error)
+	TrustedLightBlock(height int64) (*types.LightBlock, error)
+}
+
+// Client is an RPC client, which uses light#Client to verify data (if it can
+// be proved!). merkle.DefaultProofRuntime is used to verify values returned by
+// ABCIQuery.
 type Client struct {
 	service.BaseService
 
 	next rpcclient.Client
-	lc   *light.Client
-	prt  *merkle.ProofRuntime
+	lc   LightClient
+	// Proof runtime used to verify values returned by ABCIQuery
+	prt       *merkle.ProofRuntime
+	keyPathFn KeyPathFunc
 }
 
 var _ rpcclient.Client = (*Client)(nil)
 
+// Option allow you to tweak Client.
+type Option func(*Client)
+
+// KeyPathFn option can be used to set a function, which parses a given path
+// and builds the merkle path for the prover. It must be provided if you want
+// to call ABCIQuery or ABCIQueryWithOptions.
+func KeyPathFn(fn KeyPathFunc) Option {
+	return func(c *Client) {
+		c.keyPathFn = fn
+	}
+}
+
 // NewClient returns a new client.
-func NewClient(next rpcclient.Client, lc *light.Client) *Client {
+func NewClient(next rpcclient.Client, lc LightClient, opts ...Option) *Client {
 	c := &Client{
 		next: next,
 		lc:   lc,
-		prt:  defaultProofRuntime(),
+		prt:  merkle.DefaultProofRuntime(),
 	}
 	c.BaseService = *service.NewBaseService(nil, "Client", c)
+	for _, o := range opts {
+		o(c)
+	}
 	return c
 }
 
@@ -55,28 +82,33 @@ func (c *Client) OnStart() error {
 
 func (c *Client) OnStop() {
 	if c.next.IsRunning() {
-		c.next.Stop()
+		if err := c.next.Stop(); err != nil {
+			c.Logger.Error("Error stopping on next", "err", err)
+		}
 	}
 }
 
-func (c *Client) Status() (*ctypes.ResultStatus, error) {
-	return c.next.Status()
+func (c *Client) Status(ctx context.Context) (*ctypes.ResultStatus, error) {
+	return c.next.Status(ctx)
 }
 
-func (c *Client) ABCIInfo() (*ctypes.ResultABCIInfo, error) {
-	return c.next.ABCIInfo()
+func (c *Client) ABCIInfo(ctx context.Context) (*ctypes.ResultABCIInfo, error) {
+	return c.next.ABCIInfo(ctx)
 }
 
-func (c *Client) ABCIQuery(path string, data tmbytes.HexBytes) (*ctypes.ResultABCIQuery, error) {
-	return c.ABCIQueryWithOptions(path, data, rpcclient.DefaultABCIQueryOptions)
+// ABCIQuery requests proof by default.
+func (c *Client) ABCIQuery(ctx context.Context, path string, data tmbytes.HexBytes) (*ctypes.ResultABCIQuery, error) {
+	return c.ABCIQueryWithOptions(ctx, path, data, rpcclient.DefaultABCIQueryOptions)
 }
 
-// GetWithProofOptions is useful if you want full access to the ABCIQueryOptions.
-// XXX Usage of path?  It's not used, and sometimes it's /, sometimes /key, sometimes /store.
-func (c *Client) ABCIQueryWithOptions(path string, data tmbytes.HexBytes,
+// ABCIQueryWithOptions returns an error if opts.Prove is false.
+func (c *Client) ABCIQueryWithOptions(ctx context.Context, path string, data tmbytes.HexBytes,
 	opts rpcclient.ABCIQueryOptions) (*ctypes.ResultABCIQuery, error) {
 
-	res, err := c.next.ABCIQueryWithOptions(path, data, opts)
+	// always request the proof
+	opts.Prove = true
+
+	res, err := c.next.ABCIQueryWithOptions(ctx, path, data, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -86,8 +118,11 @@ func (c *Client) ABCIQueryWithOptions(path string, data tmbytes.HexBytes,
 	if resp.IsErr() {
 		return nil, fmt.Errorf("err response code: %v", resp.Code)
 	}
-	if len(resp.Key) == 0 || resp.ProofOps == nil {
-		return nil, errors.New("empty tree")
+	if len(resp.Key) == 0 {
+		return nil, errors.New("empty key")
+	}
+	if resp.ProofOps == nil || len(resp.ProofOps.Ops) == 0 {
+		return nil, errors.New("no proof ops")
 	}
 	if resp.Height <= 0 {
 		return nil, errNegOrZeroHeight
@@ -95,76 +130,76 @@ func (c *Client) ABCIQueryWithOptions(path string, data tmbytes.HexBytes,
 
 	// Update the light client if we're behind.
 	// NOTE: AppHash for height H is in header H+1.
-	h, err := c.updateLightClientIfNeededTo(resp.Height + 1)
+	l, err := c.updateLightClientIfNeededTo(ctx, resp.Height+1)
 	if err != nil {
 		return nil, err
 	}
 
 	// Validate the value proof against the trusted header.
 	if resp.Value != nil {
-		// Value exists
-		// XXX How do we encode the key into a string...
-		storeName, err := parseQueryStorePath(path)
-		if err != nil {
-			return nil, err
+		// 1) build a Merkle key path from path and resp.Key
+		if c.keyPathFn == nil {
+			return nil, errors.New("please configure Client with KeyPathFn option")
 		}
-		kp := merkle.KeyPath{}
-		kp = kp.AppendKey([]byte(storeName), merkle.KeyEncodingURL)
-		kp = kp.AppendKey(resp.Key, merkle.KeyEncodingURL)
-		err = c.prt.VerifyValue(resp.ProofOps, h.AppHash, kp.String(), resp.Value)
+
+		kp, err := c.keyPathFn(path, resp.Key)
+		if err != nil {
+			return nil, fmt.Errorf("can't build merkle key path: %w", err)
+		}
+
+		// 2) verify value
+		err = c.prt.VerifyValue(resp.ProofOps, l.AppHash, kp.String(), resp.Value)
 		if err != nil {
 			return nil, fmt.Errorf("verify value proof: %w", err)
 		}
-		return &ctypes.ResultABCIQuery{Response: resp}, nil
+	} else { // OR validate the absence proof against the trusted header.
+		err = c.prt.VerifyAbsence(resp.ProofOps, l.AppHash, string(resp.Key))
+		if err != nil {
+			return nil, fmt.Errorf("verify absence proof: %w", err)
+		}
 	}
 
-	// OR validate the ansence proof against the trusted header.
-	// XXX How do we encode the key into a string...
-	err = c.prt.VerifyAbsence(resp.ProofOps, h.AppHash, string(resp.Key))
-	if err != nil {
-		return nil, fmt.Errorf("verify absence proof: %w", err)
-	}
 	return &ctypes.ResultABCIQuery{Response: resp}, nil
 }
 
-func (c *Client) BroadcastTxCommit(tx types.Tx) (*ctypes.ResultBroadcastTxCommit, error) {
-	return c.next.BroadcastTxCommit(tx)
+func (c *Client) BroadcastTxCommit(ctx context.Context, tx types.Tx) (*ctypes.ResultBroadcastTxCommit, error) {
+	return c.next.BroadcastTxCommit(ctx, tx)
 }
 
-func (c *Client) BroadcastTxAsync(tx types.Tx) (*ctypes.ResultBroadcastTx, error) {
-	return c.next.BroadcastTxAsync(tx)
+func (c *Client) BroadcastTxAsync(ctx context.Context, tx types.Tx) (*ctypes.ResultBroadcastTx, error) {
+	return c.next.BroadcastTxAsync(ctx, tx)
 }
 
-func (c *Client) BroadcastTxSync(tx types.Tx) (*ctypes.ResultBroadcastTx, error) {
-	return c.next.BroadcastTxSync(tx)
+func (c *Client) BroadcastTxSync(ctx context.Context, tx types.Tx) (*ctypes.ResultBroadcastTx, error) {
+	return c.next.BroadcastTxSync(ctx, tx)
 }
 
-func (c *Client) UnconfirmedTxs(limit *int) (*ctypes.ResultUnconfirmedTxs, error) {
-	return c.next.UnconfirmedTxs(limit)
+func (c *Client) UnconfirmedTxs(ctx context.Context, limit *int) (*ctypes.ResultUnconfirmedTxs, error) {
+	return c.next.UnconfirmedTxs(ctx, limit)
 }
 
-func (c *Client) NumUnconfirmedTxs() (*ctypes.ResultUnconfirmedTxs, error) {
-	return c.next.NumUnconfirmedTxs()
+func (c *Client) NumUnconfirmedTxs(ctx context.Context) (*ctypes.ResultUnconfirmedTxs, error) {
+	return c.next.NumUnconfirmedTxs(ctx)
 }
 
-func (c *Client) CheckTx(tx types.Tx) (*ctypes.ResultCheckTx, error) {
-	return c.next.CheckTx(tx)
+func (c *Client) CheckTx(ctx context.Context, tx types.Tx) (*ctypes.ResultCheckTx, error) {
+	return c.next.CheckTx(ctx, tx)
 }
 
-func (c *Client) NetInfo() (*ctypes.ResultNetInfo, error) {
-	return c.next.NetInfo()
+func (c *Client) NetInfo(ctx context.Context) (*ctypes.ResultNetInfo, error) {
+	return c.next.NetInfo(ctx)
 }
 
-func (c *Client) DumpConsensusState() (*ctypes.ResultDumpConsensusState, error) {
-	return c.next.DumpConsensusState()
+func (c *Client) DumpConsensusState(ctx context.Context) (*ctypes.ResultDumpConsensusState, error) {
+	return c.next.DumpConsensusState(ctx)
 }
 
-func (c *Client) ConsensusState() (*ctypes.ResultConsensusState, error) {
-	return c.next.ConsensusState()
+func (c *Client) ConsensusState(ctx context.Context) (*ctypes.ResultConsensusState, error) {
+	return c.next.ConsensusState(ctx)
 }
 
-func (c *Client) ConsensusParams(height *int64) (*ctypes.ResultConsensusParams, error) {
-	res, err := c.next.ConsensusParams(height)
+func (c *Client) ConsensusParams(ctx context.Context, height *int64) (*ctypes.ResultConsensusParams, error) {
+	res, err := c.next.ConsensusParams(ctx, height)
 	if err != nil {
 		return nil, err
 	}
@@ -178,13 +213,13 @@ func (c *Client) ConsensusParams(height *int64) (*ctypes.ResultConsensusParams, 
 	}
 
 	// Update the light client if we're behind.
-	h, err := c.updateLightClientIfNeededTo(res.BlockHeight)
+	l, err := c.updateLightClientIfNeededTo(ctx, res.BlockHeight)
 	if err != nil {
 		return nil, err
 	}
 
 	// Verify hash.
-	if cH, tH := types.HashConsensusParams(res.ConsensusParams), h.ConsensusHash; !bytes.Equal(cH, tH) {
+	if cH, tH := types.HashConsensusParams(res.ConsensusParams), l.ConsensusHash; !bytes.Equal(cH, tH) {
 		return nil, fmt.Errorf("params hash %X does not match trusted hash %X",
 			cH, tH)
 	}
@@ -192,14 +227,14 @@ func (c *Client) ConsensusParams(height *int64) (*ctypes.ResultConsensusParams, 
 	return res, nil
 }
 
-func (c *Client) Health() (*ctypes.ResultHealth, error) {
-	return c.next.Health()
+func (c *Client) Health(ctx context.Context) (*ctypes.ResultHealth, error) {
+	return c.next.Health(ctx)
 }
 
 // BlockchainInfo calls rpcclient#BlockchainInfo and then verifies every header
 // returned.
-func (c *Client) BlockchainInfo(minHeight, maxHeight int64) (*ctypes.ResultBlockchainInfo, error) {
-	res, err := c.next.BlockchainInfo(minHeight, maxHeight)
+func (c *Client) BlockchainInfo(ctx context.Context, minHeight, maxHeight int64) (*ctypes.ResultBlockchainInfo, error) {
+	res, err := c.next.BlockchainInfo(ctx, minHeight, maxHeight)
 	if err != nil {
 		return nil, err
 	}
@@ -217,14 +252,14 @@ func (c *Client) BlockchainInfo(minHeight, maxHeight int64) (*ctypes.ResultBlock
 	// Update the light client if we're behind.
 	if len(res.BlockMetas) > 0 {
 		lastHeight := res.BlockMetas[len(res.BlockMetas)-1].Header.Height
-		if _, err := c.updateLightClientIfNeededTo(lastHeight); err != nil {
+		if _, err := c.updateLightClientIfNeededTo(ctx, lastHeight); err != nil {
 			return nil, err
 		}
 	}
 
 	// Verify each of the BlockMetas.
 	for _, meta := range res.BlockMetas {
-		h, err := c.lc.TrustedHeader(meta.Header.Height)
+		h, err := c.lc.TrustedLightBlock(meta.Header.Height)
 		if err != nil {
 			return nil, fmt.Errorf("trusted header %d: %w", meta.Header.Height, err)
 		}
@@ -237,13 +272,13 @@ func (c *Client) BlockchainInfo(minHeight, maxHeight int64) (*ctypes.ResultBlock
 	return res, nil
 }
 
-func (c *Client) Genesis() (*ctypes.ResultGenesis, error) {
-	return c.next.Genesis()
+func (c *Client) Genesis(ctx context.Context) (*ctypes.ResultGenesis, error) {
+	return c.next.Genesis(ctx)
 }
 
 // Block calls rpcclient#Block and then verifies the result.
-func (c *Client) Block(height *int64) (*ctypes.ResultBlock, error) {
-	res, err := c.next.Block(height)
+func (c *Client) Block(ctx context.Context, height *int64) (*ctypes.ResultBlock, error) {
+	res, err := c.next.Block(ctx, height)
 	if err != nil {
 		return nil, err
 	}
@@ -261,13 +296,13 @@ func (c *Client) Block(height *int64) (*ctypes.ResultBlock, error) {
 	}
 
 	// Update the light client if we're behind.
-	h, err := c.updateLightClientIfNeededTo(res.Block.Height)
+	l, err := c.updateLightClientIfNeededTo(ctx, res.Block.Height)
 	if err != nil {
 		return nil, err
 	}
 
 	// Verify block.
-	if bH, tH := res.Block.Hash(), h.Hash(); !bytes.Equal(bH, tH) {
+	if bH, tH := res.Block.Hash(), l.Hash(); !bytes.Equal(bH, tH) {
 		return nil, fmt.Errorf("block header %X does not match with trusted header %X",
 			bH, tH)
 	}
@@ -276,8 +311,8 @@ func (c *Client) Block(height *int64) (*ctypes.ResultBlock, error) {
 }
 
 // BlockByHash calls rpcclient#BlockByHash and then verifies the result.
-func (c *Client) BlockByHash(hash []byte) (*ctypes.ResultBlock, error) {
-	res, err := c.next.BlockByHash(hash)
+func (c *Client) BlockByHash(ctx context.Context, hash []byte) (*ctypes.ResultBlock, error) {
+	res, err := c.next.BlockByHash(ctx, hash)
 	if err != nil {
 		return nil, err
 	}
@@ -295,13 +330,13 @@ func (c *Client) BlockByHash(hash []byte) (*ctypes.ResultBlock, error) {
 	}
 
 	// Update the light client if we're behind.
-	h, err := c.updateLightClientIfNeededTo(res.Block.Height)
+	l, err := c.updateLightClientIfNeededTo(ctx, res.Block.Height)
 	if err != nil {
 		return nil, err
 	}
 
 	// Verify block.
-	if bH, tH := res.Block.Hash(), h.Hash(); !bytes.Equal(bH, tH) {
+	if bH, tH := res.Block.Hash(), l.Hash(); !bytes.Equal(bH, tH) {
 		return nil, fmt.Errorf("block header %X does not match with trusted header %X",
 			bH, tH)
 	}
@@ -311,10 +346,10 @@ func (c *Client) BlockByHash(hash []byte) (*ctypes.ResultBlock, error) {
 
 // BlockResults returns the block results for the given height. If no height is
 // provided, the results of the block preceding the latest are returned.
-func (c *Client) BlockResults(height *int64) (*ctypes.ResultBlockResults, error) {
+func (c *Client) BlockResults(ctx context.Context, height *int64) (*ctypes.ResultBlockResults, error) {
 	var h int64
 	if height == nil {
-		res, err := c.next.Status()
+		res, err := c.next.Status(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("can't get latest height: %w", err)
 		}
@@ -325,7 +360,7 @@ func (c *Client) BlockResults(height *int64) (*ctypes.ResultBlockResults, error)
 		h = *height
 	}
 
-	res, err := c.next.BlockResults(&h)
+	res, err := c.next.BlockResults(ctx, &h)
 	if err != nil {
 		return nil, err
 	}
@@ -336,7 +371,7 @@ func (c *Client) BlockResults(height *int64) (*ctypes.ResultBlockResults, error)
 	}
 
 	// Update the light client if we're behind.
-	trustedHeader, err := c.updateLightClientIfNeededTo(h + 1)
+	trustedBlock, err := c.updateLightClientIfNeededTo(ctx, h+1)
 	if err != nil {
 		return nil, err
 	}
@@ -364,47 +399,31 @@ func (c *Client) BlockResults(height *int64) (*ctypes.ResultBlockResults, error)
 	rH := merkle.HashFromByteSlices([][]byte{bbeBytes, results.Hash(), ebeBytes})
 
 	// Verify block results.
-	if !bytes.Equal(rH, trustedHeader.LastResultsHash) {
+	if !bytes.Equal(rH, trustedBlock.LastResultsHash) {
 		return nil, fmt.Errorf("last results %X does not match with trusted last results %X",
-			rH, trustedHeader.LastResultsHash)
+			rH, trustedBlock.LastResultsHash)
 	}
 
 	return res, nil
 }
 
-func (c *Client) Commit(height *int64) (*ctypes.ResultCommit, error) {
-	res, err := c.next.Commit(height)
+func (c *Client) Commit(ctx context.Context, height *int64) (*ctypes.ResultCommit, error) {
+	// Update the light client if we're behind and retrieve the light block at the requested height
+	l, err := c.updateLightClientIfNeededTo(ctx, *height)
 	if err != nil {
 		return nil, err
 	}
 
-	// Validate res.
-	if err := res.SignedHeader.ValidateBasic(c.lc.ChainID()); err != nil {
-		return nil, err
-	}
-	if res.Height <= 0 {
-		return nil, errNegOrZeroHeight
-	}
-
-	// Update the light client if we're behind.
-	h, err := c.updateLightClientIfNeededTo(res.Height)
-	if err != nil {
-		return nil, err
-	}
-
-	// Verify commit.
-	if rH, tH := res.Hash(), h.Hash(); !bytes.Equal(rH, tH) {
-		return nil, fmt.Errorf("header %X does not match with trusted header %X",
-			rH, tH)
-	}
-
-	return res, nil
+	return &ctypes.ResultCommit{
+		SignedHeader:    *l.SignedHeader,
+		CanonicalCommit: true,
+	}, nil
 }
 
 // Tx calls rpcclient#Tx method and then verifies the proof if such was
 // requested.
-func (c *Client) Tx(hash []byte, prove bool) (*ctypes.ResultTx, error) {
-	res, err := c.next.Tx(hash, prove)
+func (c *Client) Tx(ctx context.Context, hash []byte, prove bool) (*ctypes.ResultTx, error) {
+	res, err := c.next.Tx(ctx, hash, prove)
 	if err != nil || !prove {
 		return res, err
 	}
@@ -415,71 +434,49 @@ func (c *Client) Tx(hash []byte, prove bool) (*ctypes.ResultTx, error) {
 	}
 
 	// Update the light client if we're behind.
-	h, err := c.updateLightClientIfNeededTo(res.Height)
+	l, err := c.updateLightClientIfNeededTo(ctx, res.Height)
 	if err != nil {
 		return nil, err
 	}
 
 	// Validate the proof.
-	return res, res.Proof.Validate(h.DataHash)
+	return res, res.Proof.Validate(l.DataHash)
 }
 
-func (c *Client) TxSearch(query string, prove bool, page, perPage *int, orderBy string) (
+func (c *Client) TxSearch(ctx context.Context, query string, prove bool, page, perPage *int, orderBy string) (
 	*ctypes.ResultTxSearch, error) {
-	return c.next.TxSearch(query, prove, page, perPage, orderBy)
+	return c.next.TxSearch(ctx, query, prove, page, perPage, orderBy)
 }
 
 // Validators fetches and verifies validators.
-//
-// WARNING: only full validator sets are verified (when length of validators is
-// less than +perPage+. +perPage+ default is 30, max is 100).
-func (c *Client) Validators(height *int64, page, perPage *int) (*ctypes.ResultValidators, error) {
-	res, err := c.next.Validators(height, page, perPage)
+func (c *Client) Validators(ctx context.Context, height *int64, pagePtr, perPagePtr *int) (*ctypes.ResultValidators,
+	error) {
+	// Update the light client if we're behind and retrieve the light block at the requested height.
+	l, err := c.updateLightClientIfNeededTo(ctx, *height)
 	if err != nil {
 		return nil, err
 	}
 
-	// Validate res.
-	if res.BlockHeight <= 0 {
-		return nil, errNegOrZeroHeight
-	}
-
-	updateHeight := res.BlockHeight - 1
-
-	// updateHeight can't be zero which happens when we are looking for the validators of the first block
-	if updateHeight == 0 {
-		updateHeight = 1
-	}
-
-	// Update the light client if we're behind.
-	h, err := c.updateLightClientIfNeededTo(updateHeight)
+	totalCount := len(l.ValidatorSet.Validators)
+	perPage := validatePerPage(perPagePtr)
+	page, err := validatePage(pagePtr, perPage, totalCount)
 	if err != nil {
 		return nil, err
 	}
 
-	var tH tmbytes.HexBytes
-	switch res.BlockHeight {
-	case 1:
-		// if it's the first block we need to validate with the current validator hash as opposed to the
-		// next validator hash
-		tH = h.ValidatorsHash
-	default:
-		tH = h.NextValidatorsHash
-	}
+	skipCount := validateSkipCount(page, perPage)
 
-	// Verify validators.
-	if res.Count <= res.Total {
-		if rH := types.NewValidatorSet(res.Validators).Hash(); !bytes.Equal(rH, tH) {
-			return nil, fmt.Errorf("validators %X does not match with trusted validators %X",
-				rH, tH)
-		}
-	}
+	v := l.ValidatorSet.Validators[skipCount : skipCount+tmmath.MinInt(perPage, totalCount-skipCount)]
 
-	return res, nil
+	return &ctypes.ResultValidators{
+		BlockHeight: *height,
+		Validators:  v,
+		Count:       len(v),
+		Total:       totalCount}, nil
 }
 
-func (c *Client) BroadcastEvidence(ev types.Evidence) (*ctypes.ResultBroadcastEvidence, error) {
-	return c.next.BroadcastEvidence(ev)
+func (c *Client) BroadcastEvidence(ctx context.Context, ev types.Evidence) (*ctypes.ResultBroadcastEvidence, error) {
+	return c.next.BroadcastEvidence(ctx, ev)
 }
 
 func (c *Client) Subscribe(ctx context.Context, subscriber, query string,
@@ -495,12 +492,12 @@ func (c *Client) UnsubscribeAll(ctx context.Context, subscriber string) error {
 	return c.next.UnsubscribeAll(ctx, subscriber)
 }
 
-func (c *Client) updateLightClientIfNeededTo(height int64) (*types.SignedHeader, error) {
-	h, err := c.lc.VerifyHeaderAtHeight(height, time.Now())
+func (c *Client) updateLightClientIfNeededTo(ctx context.Context, height int64) (*types.LightBlock, error) {
+	l, err := c.lc.VerifyLightBlockAtHeight(ctx, height, time.Now())
 	if err != nil {
 		return nil, fmt.Errorf("failed to update light client to %d: %w", height, err)
 	}
-	return h, nil
+	return l, nil
 }
 
 func (c *Client) RegisterOpDecoder(typ string, dec merkle.OpDecoder) {
@@ -556,20 +553,53 @@ func (c *Client) UnsubscribeAllWS(ctx *rpctypes.Context) (*ctypes.ResultUnsubscr
 	return &ctypes.ResultUnsubscribe{}, nil
 }
 
-func parseQueryStorePath(path string) (storeName string, err error) {
-	if !strings.HasPrefix(path, "/") {
-		return "", errors.New("expected path to start with /")
+// XXX: Copied from rpc/core/env.go
+const (
+	// see README
+	defaultPerPage = 30
+	maxPerPage     = 100
+)
+
+func validatePage(pagePtr *int, perPage, totalCount int) (int, error) {
+	if perPage < 1 {
+		panic(fmt.Sprintf("zero or negative perPage: %d", perPage))
 	}
 
-	paths := strings.SplitN(path[1:], "/", 3)
-	switch {
-	case len(paths) != 3:
-		return "", errors.New("expected format like /store/<storeName>/key")
-	case paths[0] != "store":
-		return "", errors.New("expected format like /store/<storeName>/key")
-	case paths[2] != "key":
-		return "", errors.New("expected format like /store/<storeName>/key")
+	if pagePtr == nil { // no page parameter
+		return 1, nil
 	}
 
-	return paths[1], nil
+	pages := ((totalCount - 1) / perPage) + 1
+	if pages == 0 {
+		pages = 1 // one page (even if it's empty)
+	}
+	page := *pagePtr
+	if page <= 0 || page > pages {
+		return 1, fmt.Errorf("page should be within [1, %d] range, given %d", pages, page)
+	}
+
+	return page, nil
+}
+
+func validatePerPage(perPagePtr *int) int {
+	if perPagePtr == nil { // no per_page parameter
+		return defaultPerPage
+	}
+
+	perPage := *perPagePtr
+	if perPage < 1 {
+		return defaultPerPage
+	} else if perPage > maxPerPage {
+		return maxPerPage
+	}
+	return perPage
+}
+
+func validateSkipCount(page, perPage int) int {
+	skipCount := (page - 1) * perPage
+	if skipCount < 0 {
+		return 0
+	}
+
+	return skipCount
 }

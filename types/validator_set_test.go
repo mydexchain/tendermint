@@ -1425,6 +1425,25 @@ func verifyValSetUpdatePriorityOrder(t *testing.T, valSet *ValidatorSet, cfg tes
 	}
 }
 
+func TestNewValidatorSetFromExistingValidators(t *testing.T) {
+	size := 5
+	vals := make([]*Validator, size)
+	for i := 0; i < size; i++ {
+		pv := NewMockPV()
+		vals[i] = pv.ExtractIntoValidator(int64(i + 1))
+	}
+	valSet := NewValidatorSet(vals)
+	valSet.IncrementProposerPriority(5)
+
+	newValSet := NewValidatorSet(valSet.Validators)
+	assert.NotEqual(t, valSet, newValSet)
+
+	existingValSet, err := ValidatorSetFromExistingValidators(valSet.Validators)
+	assert.NoError(t, err)
+	assert.Equal(t, valSet, existingValSet)
+	assert.Equal(t, valSet.CopyIncrementProposerPriority(3), existingValSet.CopyIncrementProposerPriority(3))
+}
+
 func TestValSetUpdateOverflowRelated(t *testing.T) {
 	testCases := []testVSetCfg{
 		{
@@ -1639,9 +1658,7 @@ func (valz validatorsByPriority) Less(i, j int) bool {
 }
 
 func (valz validatorsByPriority) Swap(i, j int) {
-	it := valz[i]
-	valz[i] = valz[j]
-	valz[j] = it
+	valz[i], valz[j] = valz[j], valz[i]
 }
 
 //-------------------------------------
@@ -1660,9 +1677,7 @@ func (tvals testValsByVotingPower) Less(i, j int) bool {
 }
 
 func (tvals testValsByVotingPower) Swap(i, j int) {
-	it := tvals[i]
-	tvals[i] = tvals[j]
-	tvals[j] = it
+	tvals[i], tvals[j] = tvals[j], tvals[i]
 }
 
 //-------------------------------------
