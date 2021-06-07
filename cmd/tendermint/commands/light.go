@@ -52,7 +52,7 @@ for applications built w/ Chain SDK).
 `,
 	RunE: runProxy,
 	Args: cobra.ExactArgs(1),
-	Example: `light chainhub-3 -p http://52.57.29.196:26657 -w http://public-seed-node.chainhub.certus.one:26657
+	Example: `light chainhub-3 -p http://152.12.29.196:26657 -w http://public-seed-node.mydexchain.io:26657
 	--height 962118 --hash 28B97BE9F6DE51AC69F70E0B7BFD7E5C9CD1A595B7DC31AFF27C50D4948020CD`,
 }
 
