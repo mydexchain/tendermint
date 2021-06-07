@@ -275,7 +275,6 @@ func (sc *SecretConnection) Read(data []byte) (n int, err error) {
 }
 
 // Implements net.Conn
-// nolint
 func (sc *SecretConnection) Close() error                  { return sc.conn.Close() }
 func (sc *SecretConnection) LocalAddr() net.Addr           { return sc.conn.(net.Conn).LocalAddr() }
 func (sc *SecretConnection) RemoteAddr() net.Addr          { return sc.conn.(net.Conn).RemoteAddr() }
@@ -313,7 +312,7 @@ func shareEphPubKey(conn io.ReadWriter, locEphPub *[32]byte) (remEphPub *[32]byt
 		},
 		func(_ int) (val interface{}, abort bool, err error) {
 			var bytes gogotypes.BytesValue
-			err = protoio.NewDelimitedReader(conn, 1024*1024).ReadMsg(&bytes)
+			_, err = protoio.NewDelimitedReader(conn, 1024*1024).ReadMsg(&bytes)
 			if err != nil {
 				return nil, true, err // abort
 			}
@@ -419,7 +418,7 @@ func shareAuthSignature(sc io.ReadWriter, pubKey crypto.PubKey, signature []byte
 		},
 		func(_ int) (val interface{}, abort bool, err error) {
 			var pba tmp2p.AuthSigMessage
-			err = protoio.NewDelimitedReader(sc, 1024*1024).ReadMsg(&pba)
+			_, err = protoio.NewDelimitedReader(sc, 1024*1024).ReadMsg(&pba)
 			if err != nil {
 				return nil, true, err // abort
 			}

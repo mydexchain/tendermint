@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -16,7 +15,6 @@ import (
 
 	dbm "github.com/mydexchain/tm-db"
 
-	"github.com/mydexchain/tendermint/crypto/merkle"
 	"github.com/mydexchain/tendermint/libs/log"
 	tmmath "github.com/mydexchain/tendermint/libs/math"
 	tmos "github.com/mydexchain/tendermint/libs/os"
@@ -24,7 +22,6 @@ import (
 	lproxy "github.com/mydexchain/tendermint/light/proxy"
 	lrpc "github.com/mydexchain/tendermint/light/rpc"
 	dbs "github.com/mydexchain/tendermint/light/store/db"
-	rpchttp "github.com/mydexchain/tendermint/rpc/client/http"
 	rpcserver "github.com/mydexchain/tendermint/rpc/jsonrpc/server"
 )
 
@@ -52,7 +49,7 @@ for applications built w/ Chain SDK).
 `,
 	RunE: runProxy,
 	Args: cobra.ExactArgs(1),
-	Example: `light chainhub-3 -p http://152.12.29.196:26657 -w http://public-seed-node.mydexchain.io:26657
+	Example: `light Chainhub-3 -p http://52.57.29.196:26657 -w http://public-seed-node.Chainhub.certus.one:26657
 	--height 962118 --hash 28B97BE9F6DE51AC69F70E0B7BFD7E5C9CD1A595B7DC31AFF27C50D4948020CD`,
 }
 
@@ -204,11 +201,6 @@ func runProxy(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	rpcClient, err := rpchttp.New(primaryAddr, "/websocket")
-	if err != nil {
-		return fmt.Errorf("http client for %s: %w", primaryAddr, err)
-	}
-
 	cfg := rpcserver.DefaultConfig()
 	cfg.MaxBodyBytes = config.RPC.MaxBodyBytes
 	cfg.MaxHeaderBytes = config.RPC.MaxHeaderBytes
@@ -220,12 +212,11 @@ func runProxy(cmd *cobra.Command, args []string) error {
 		cfg.WriteTimeout = config.RPC.TimeoutBroadcastTxCommit + 1*time.Second
 	}
 
-	p := lproxy.Proxy{
-		Addr:   listenAddr,
-		Config: cfg,
-		Client: lrpc.NewClient(rpcClient, c, lrpc.KeyPathFn(defaultMerkleKeyPathFn())),
-		Logger: logger,
+	p, err := lproxy.NewProxy(c, listenAddr, primaryAddr, cfg, logger, lrpc.KeyPathFn(lrpc.DefaultMerkleKeyPathFn()))
+	if err != nil {
+		return err
 	}
+
 	// Stop upon receiving SIGTERM or CTRL-C.
 	tmos.TrapSignal(logger, func() {
 		p.Listener.Close()
@@ -263,22 +254,4 @@ func saveProviders(db dbm.DB, primaryAddr, witnessesAddrs string) error {
 		return fmt.Errorf("failed to save witness providers: %w", err)
 	}
 	return nil
-}
-
-func defaultMerkleKeyPathFn() lrpc.KeyPathFunc {
-	// regexp for extracting store name from /abci_query path
-	storeNameRegexp := regexp.MustCompile(`\/store\/(.+)\/key`)
-
-	return func(path string, key []byte) (merkle.KeyPath, error) {
-		matches := storeNameRegexp.FindStringSubmatch(path)
-		if len(matches) != 2 {
-			return nil, fmt.Errorf("can't find store name in %s using %s", path, storeNameRegexp)
-		}
-		storeName := matches[1]
-
-		kp := merkle.KeyPath{}
-		kp = kp.AppendKey([]byte(storeName), merkle.KeyEncodingURL)
-		kp = kp.AppendKey(key, merkle.KeyEncodingURL)
-		return kp, nil
-	}
 }

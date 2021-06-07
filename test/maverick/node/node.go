@@ -40,6 +40,9 @@ import (
 	grpccore "github.com/mydexchain/tendermint/rpc/grpc"
 	rpcserver "github.com/mydexchain/tendermint/rpc/jsonrpc/server"
 	sm "github.com/mydexchain/tendermint/state"
+	"github.com/mydexchain/tendermint/state/indexer"
+	blockidxkv "github.com/mydexchain/tendermint/state/indexer/block/kv"
+	blockidxnull "github.com/mydexchain/tendermint/state/indexer/block/null"
 	"github.com/mydexchain/tendermint/state/txindex"
 	"github.com/mydexchain/tendermint/state/txindex/kv"
 	"github.com/mydexchain/tendermint/state/txindex/null"
@@ -138,19 +141,19 @@ func DefaultNewNode(config *cfg.Config, logger log.Logger, misbehaviors map[int6
 }
 
 // MetricsProvider returns a consensus, p2p and mempool Metrics.
-type MetricsProvider func(chainID string) (*cs.Metrics, *p2p.Metrics, *mempl.Metrics, *sm.Metrics)
+type MetricsProvider func(chainID string) (*consensus.Metrics, *p2p.Metrics, *mempl.Metrics, *sm.Metrics)
 
 // DefaultMetricsProvider returns Metrics build using Prometheus client library
 // if Prometheus is enabled. Otherwise, it returns no-op Metrics.
 func DefaultMetricsProvider(config *cfg.InstrumentationConfig) MetricsProvider {
-	return func(chainID string) (*cs.Metrics, *p2p.Metrics, *mempl.Metrics, *sm.Metrics) {
+	return func(chainID string) (*consensus.Metrics, *p2p.Metrics, *mempl.Metrics, *sm.Metrics) {
 		if config.Prometheus {
-			return cs.PrometheusMetrics(config.Namespace, "chain_id", chainID),
+			return consensus.PrometheusMetrics(config.Namespace, "chain_id", chainID),
 				p2p.PrometheusMetrics(config.Namespace, "chain_id", chainID),
 				mempl.PrometheusMetrics(config.Namespace, "chain_id", chainID),
 				sm.PrometheusMetrics(config.Namespace, "chain_id", chainID)
 		}
-		return cs.NopMetrics(), p2p.NopMetrics(), mempl.NopMetrics(), sm.NopMetrics()
+		return consensus.NopMetrics(), p2p.NopMetrics(), mempl.NopMetrics(), sm.NopMetrics()
 	}
 }
 
@@ -248,6 +251,7 @@ type Node struct {
 	proxyApp          proxy.AppConns          // connection to the application
 	rpcListeners      []net.Listener          // rpc servers
 	txIndexer         txindex.TxIndexer
+	blockIndexer      indexer.BlockIndexer
 	indexerService    *txindex.IndexerService
 	prometheusSrv     *http.Server
 }
@@ -286,27 +290,40 @@ func createAndStartEventBus(logger log.Logger) (*types.EventBus, error) {
 	return eventBus, nil
 }
 
-func createAndStartIndexerService(config *cfg.Config, dbProvider DBProvider,
-	eventBus *types.EventBus, logger log.Logger) (*txindex.IndexerService, txindex.TxIndexer, error) {
+func createAndStartIndexerService(
+	config *cfg.Config,
+	dbProvider DBProvider,
+	eventBus *types.EventBus,
+	logger log.Logger,
+) (*txindex.IndexerService, txindex.TxIndexer, indexer.BlockIndexer, error) {
 
-	var txIndexer txindex.TxIndexer
+	var (
+		txIndexer    txindex.TxIndexer
+		blockIndexer indexer.BlockIndexer
+	)
+
 	switch config.TxIndex.Indexer {
 	case "kv":
 		store, err := dbProvider(&DBContext{"tx_index", config})
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
+
 		txIndexer = kv.NewTxIndex(store)
+		blockIndexer = blockidxkv.New(dbm.NewPrefixDB(store, []byte("block_events")))
 	default:
 		txIndexer = &null.TxIndex{}
+		blockIndexer = &blockidxnull.BlockerIndexer{}
 	}
 
-	indexerService := txindex.NewIndexerService(txIndexer, eventBus)
+	indexerService := txindex.NewIndexerService(txIndexer, blockIndexer, eventBus)
 	indexerService.SetLogger(logger.With("module", "txindex"))
+
 	if err := indexerService.Start(); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return indexerService, txIndexer, nil
+
+	return indexerService, txIndexer, blockIndexer, nil
 }
 
 func doHandshake(
@@ -427,7 +444,7 @@ func createConsensusReactor(config *cfg.Config,
 	mempool *mempl.CListMempool,
 	evidencePool *evidence.Pool,
 	privValidator types.PrivValidator,
-	csMetrics *cs.Metrics,
+	csMetrics *consensus.Metrics,
 	waitSync bool,
 	eventBus *types.EventBus,
 	consensusLogger log.Logger,
@@ -700,8 +717,7 @@ func NewNode(config *cfg.Config,
 		return nil, err
 	}
 
-	// Transaction indexing
-	indexerService, txIndexer, err := createAndStartIndexerService(config, dbProvider, eventBus, logger)
+	indexerService, txIndexer, blockIndexer, err := createAndStartIndexerService(config, dbProvider, eventBus, logger)
 	if err != nil {
 		return nil, err
 	}
@@ -877,6 +893,7 @@ func NewNode(config *cfg.Config,
 		proxyApp:         proxyApp,
 		txIndexer:        txIndexer,
 		indexerService:   indexerService,
+		blockIndexer:     blockIndexer,
 		eventBus:         eventBus,
 	}
 	node.BaseService = *service.NewBaseService(logger, "Node", node)
@@ -1033,6 +1050,7 @@ func (n *Node) ConfigureRPC() error {
 		PubKey:           pubKey,
 		GenDoc:           n.genesisDoc,
 		TxIndexer:        n.txIndexer,
+		BlockIndexer:     n.blockIndexer,
 		ConsensusReactor: &consensus.Reactor{},
 		EventBus:         n.eventBus,
 		Mempool:          n.mempool,

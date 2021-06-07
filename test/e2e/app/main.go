@@ -1,11 +1,14 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/spf13/viper"
@@ -16,10 +19,16 @@ import (
 	tmflags "github.com/mydexchain/tendermint/libs/cli/flags"
 	"github.com/mydexchain/tendermint/libs/log"
 	tmnet "github.com/mydexchain/tendermint/libs/net"
+	"github.com/mydexchain/tendermint/light"
+	lproxy "github.com/mydexchain/tendermint/light/proxy"
+	lrpc "github.com/mydexchain/tendermint/light/rpc"
+	dbs "github.com/mydexchain/tendermint/light/store/db"
 	"github.com/mydexchain/tendermint/node"
 	"github.com/mydexchain/tendermint/p2p"
 	"github.com/mydexchain/tendermint/privval"
 	"github.com/mydexchain/tendermint/proxy"
+	rpcserver "github.com/mydexchain/tendermint/rpc/jsonrpc/server"
+	e2e "github.com/mydexchain/tendermint/test/e2e/pkg"
 	mcs "github.com/mydexchain/tendermint/test/maverick/consensus"
 	maverick "github.com/mydexchain/tendermint/test/maverick/node"
 )
@@ -66,7 +75,11 @@ func run(configFile string) error {
 		err = startApp(cfg)
 	case "builtin":
 		if len(cfg.Misbehaviors) == 0 {
-			err = startNode(cfg)
+			if cfg.Mode == string(e2e.ModeLight) {
+				err = startLightClient(cfg)
+			} else {
+				err = startNode(cfg)
+			}
 		} else {
 			err = startMaverick(cfg)
 		}
@@ -131,6 +144,64 @@ func startNode(cfg *Config) error {
 	return n.Start()
 }
 
+func startLightClient(cfg *Config) error {
+	tmcfg, nodeLogger, _, err := setupNode()
+	if err != nil {
+		return err
+	}
+
+	dbContext := &node.DBContext{ID: "light", Config: tmcfg}
+	lightDB, err := node.DefaultDBProvider(dbContext)
+	if err != nil {
+		return err
+	}
+
+	providers := rpcEndpoints(tmcfg.P2P.PersistentPeers)
+
+	c, err := light.NewHTTPClient(
+		context.Background(),
+		cfg.ChainID,
+		light.TrustOptions{
+			Period: tmcfg.StateSync.TrustPeriod,
+			Height: tmcfg.StateSync.TrustHeight,
+			Hash:   tmcfg.StateSync.TrustHashBytes(),
+		},
+		providers[0],
+		providers[1:],
+		dbs.New(lightDB, "light"),
+		light.Logger(nodeLogger),
+	)
+	if err != nil {
+		return err
+	}
+
+	rpccfg := rpcserver.DefaultConfig()
+	rpccfg.MaxBodyBytes = tmcfg.RPC.MaxBodyBytes
+	rpccfg.MaxHeaderBytes = tmcfg.RPC.MaxHeaderBytes
+	rpccfg.MaxOpenConnections = tmcfg.RPC.MaxOpenConnections
+	// If necessary adjust global WriteTimeout to ensure it's greater than
+	// TimeoutBroadcastTxCommit.
+	// See https://github.com/mydexchain/tendermint/issues/3435
+	if rpccfg.WriteTimeout <= tmcfg.RPC.TimeoutBroadcastTxCommit {
+		rpccfg.WriteTimeout = tmcfg.RPC.TimeoutBroadcastTxCommit + 1*time.Second
+	}
+
+	p, err := lproxy.NewProxy(c, tmcfg.RPC.ListenAddress, providers[0], rpccfg, nodeLogger,
+		lrpc.KeyPathFn(lrpc.DefaultMerkleKeyPathFn()))
+	if err != nil {
+		return err
+	}
+
+	logger.Info("Starting proxy...", "laddr", tmcfg.RPC.ListenAddress)
+	if err := p.ListenAndServe(); err != http.ErrServerClosed {
+		// Error starting or closing listener:
+		logger.Error("proxy ListenAndServe", "err", err)
+	}
+
+	return nil
+}
+
+// FIXME: Temporarily disconnected maverick until it is redesigned
 // startMaverick starts a Maverick node that runs the application directly. It assumes the Tendermint
 // configuration is in $TMHOME/config/tendermint.toml.
 func startMaverick(cfg *Config) error {
@@ -200,28 +271,35 @@ func setupNode() (*config.Config, log.Logger, *p2p.NodeKey, error) {
 	if home == "" {
 		return nil, nil, nil, errors.New("TMHOME not set")
 	}
+
 	viper.AddConfigPath(filepath.Join(home, "config"))
 	viper.SetConfigName("config")
-	err := viper.ReadInConfig()
-	if err != nil {
+
+	if err := viper.ReadInConfig(); err != nil {
 		return nil, nil, nil, err
 	}
+
 	tmcfg = config.DefaultConfig()
-	err = viper.Unmarshal(tmcfg)
-	if err != nil {
+
+	if err := viper.Unmarshal(tmcfg); err != nil {
 		return nil, nil, nil, err
 	}
+
 	tmcfg.SetRoot(home)
-	if err = tmcfg.ValidateBasic(); err != nil {
+
+	if err := tmcfg.ValidateBasic(); err != nil {
 		return nil, nil, nil, fmt.Errorf("error in config file: %w", err)
 	}
+
 	if tmcfg.LogFormat == config.LogFormatJSON {
 		logger = log.NewTMJSONLogger(log.NewSyncWriter(os.Stdout))
 	}
-	nodeLogger, err := tmflags.ParseLogLevel(tmcfg.LogLevel, logger, config.DefaultLogLevel())
+
+	nodeLogger, err := tmflags.ParseLogLevel(tmcfg.LogLevel, logger, config.DefaultLogLevel)
 	if err != nil {
 		return nil, nil, nil, err
 	}
+
 	nodeLogger = nodeLogger.With("module", "main")
 
 	nodeKey, err := p2p.LoadOrGenNodeKey(tmcfg.NodeKeyFile())
@@ -230,4 +308,20 @@ func setupNode() (*config.Config, log.Logger, *p2p.NodeKey, error) {
 	}
 
 	return tmcfg, nodeLogger, nodeKey, nil
+}
+
+// rpcEndpoints takes a list of persistent peers and splits them into a list of rpc endpoints
+// using 26657 as the port number
+func rpcEndpoints(peers string) []string {
+	arr := strings.Split(peers, ",")
+	endpoints := make([]string, len(arr))
+	for i, v := range arr {
+		urlString := strings.SplitAfter(v, "@")[1]
+		hostName := strings.Split(urlString, ":26656")[0]
+		// use RPC port instead
+		port := 26657
+		rpcEndpoint := "http://" + hostName + ":" + fmt.Sprint(port)
+		endpoints[i] = rpcEndpoint
+	}
+	return endpoints
 }
